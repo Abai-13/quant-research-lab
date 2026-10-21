@@ -1,0 +1,22 @@
+[project]
+name = "ai-quant-simulator-backend"
+version = "0.1.0"
+description = "阶段 1 本地基础后端：配置、SQLite 元信息与状态接口"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi==0.156.4",
+    "uvicorn==0.54.0",
+    "python-dotenv==1.2.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "httpx==0.28.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# 允许在 backend 目录（以及以 backend 为 rootdir 的调用）直接导入 app 包。
+pythonpath = ["."]

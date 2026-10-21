@@ -1,0 +1,5 @@
+# 阶段 1 后端直接运行依赖（精确版本）。
+# 完整可复现安装请使用 requirements.lock。
+fastapi==0.156.4
+uvicorn==0.54.0
+python-dotenv==1.2.4
