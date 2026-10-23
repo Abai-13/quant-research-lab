@@ -48,6 +48,7 @@ from .records import (
     spec_for,
 )
 from .chunks import publish_chunked_version
+from .schema import SCHEMA_VERSION
 from .sources import sync_source_registry
 from .store import latest_active_version_id, write_records
 from .timeutil import parse_yyyymmdd, utc_now_iso, yyyymmdd
@@ -565,10 +566,10 @@ def _run_import_locked(
     try:
         metadata = dict(conn.execute("SELECT key, value FROM app_metadata").fetchall())
         version = int(metadata.get("schema_version", "0"))
-        if version != 3:
+        if version != SCHEMA_VERSION:
             raise DataError(
                 "migration_required",
-                f"数据库 schema 版本为 {version}，需要先执行显式迁移命令（目标 schema 3）",
+                f"数据库 schema 版本为 {version}，需要先执行显式迁移命令（目标 schema {SCHEMA_VERSION}）",
             )
 
         sync_source_registry(conn, source_code)

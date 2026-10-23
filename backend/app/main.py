@@ -14,16 +14,19 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from . import DISPLAY_NAME, MODE, SERVICE_NAME, __version__
+from .api.portfolio import create_portfolio_router
 from .config import Settings, load_settings
+from .data.errors import DataError
 from .data.status import data_status
 from .db import DatabaseStatus, check_database, initialize_database
 
 logger = logging.getLogger("app.main")
 
 LIMITATIONS = [
-    "本阶段建立数据接入与质量检查基础，不实现策略、回测、模拟账户或调度。",
+    "阶段三已实现本地个人持仓、组合建议、模拟成交、公司行为与 NAV/收益；不接券商、不自动下单。",
+    "离线演示使用独立合成数据库，页面始终标注合成数据；不会写入个人账户或真实行情。",
     "未实现登录与公网访问保护，服务默认只监听本机回环地址。",
-    "页面中的功能状态来自后端接口，不代表策略有效或能够盈利。",
+    "页面中的功能状态来自后端接口，不代表策略有效或能够盈利；费用/滑点/涨跌停均为版本化模拟假设。",
     "行情可用资格由数据资格接口判断，缺失或陈旧的数据不会被当作合格输入。",
 ]
 
@@ -68,6 +71,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         description="阶段 1 本地基础状态服务",
         lifespan=lifespan,
     )
+
+    @app.exception_handler(DataError)
+    async def data_error_handler(request: Request, exc: DataError) -> JSONResponse:
+        """业务校验失败返回稳定原因码，不吞掉为 500。"""
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "reason": exc.reason, "detail": str(exc)},
+        )
+
+    app.include_router(create_portfolio_router())
 
     @app.get("/api/health")
     def health() -> dict:
@@ -183,11 +196,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "pool_snapshots": data.get("pool_snapshots"),
             },
             "account": {
-                "status": "not_initialized",
+                "status": "available",
                 "net_value": None,
                 "cumulative_return": None,
             },
-            "strategy": {"status": "not_implemented"},
+            "strategy": {"status": "available"},
             "scheduler": {"status": "not_implemented"},
             "ai": {"status": "not_configured"},
             "limitations": LIMITATIONS,

@@ -35,6 +35,7 @@ export type FeatureState =
   | "pending_check"
   | "partial_coverage"
   | "limited"
+  | "available"
   | "available_in_range"
   | "migration_required";
 

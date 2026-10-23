@@ -94,10 +94,10 @@ def test_system_status_is_honest_about_missing_features(temp_settings: Settings)
     body = response.json()
     assert body["mode"] == "local"
     assert body["market_data"]["status"] == "not_connected"
-    assert body["account"]["status"] == "not_initialized"
+    assert body["account"]["status"] == "available"
     assert body["account"]["net_value"] is None
     assert body["account"]["cumulative_return"] is None
-    assert body["strategy"]["status"] == "not_implemented"
+    assert body["strategy"]["status"] == "available"
     assert body["scheduler"]["status"] == "not_implemented"
     assert body["ai"]["status"] == "not_configured"
     assert body["limitations"]

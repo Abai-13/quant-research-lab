@@ -1,7 +1,7 @@
 """数据库初始化、只读检查与显式 schema 升级。
 
 阶段 1 行为保持兼容：初始化幂等且保留 ``schema_version``/``instance_id``/``created_at``；
-schema 1/2 的既有库必须显式 ``migrate_database`` 才升级，readiness 只读并提示
+schema 1/2/3 的既有库必须显式 ``migrate_database`` 才升级，readiness 只读并提示
 ``migration_required``，不修改任何表。
 
 迁移遵循 C1 冻结约束：
@@ -9,8 +9,10 @@ schema 1/2 的既有库必须显式 ``migrate_database`` 才升级，readiness �
 - 维护运行记录 ``prepared`` 写在独立 ``maintenance.db``，业务库在备份验证前不写入；
 - 备份包包含数据库与全部被引用的外部文件，并在临时目录独立验证；
 - 结构变更、``schema_version`` 与准确的 ``schema_history(from,to)`` 在同一业务事务提交；
-- schema 1 按 1→2、2→3 两个准确事务执行；新库直接建 schema 3，不写虚假迁移历史；
-- 旧版本成员可转换为分块存储，version_id/manifest_version/manifest_sha256 不变。
+- schema 1/2/3 按准确事务逐级执行（1→2、2→3、3→4）；新库直接建 schema 4，
+  不写虚假迁移历史；
+- 阶段三 3→4 为纯增量：不修改、不删除、不改写任何既有行；旧版本成员可转换为
+  分块存储，version_id/manifest_version/manifest_sha256 不变。
 """
 
 from __future__ import annotations
@@ -43,6 +45,8 @@ __all__ = [
 ]
 
 _REQUIRED_KEYS = ("schema_version", "created_at", "instance_id")
+
+_MIGRATABLE_VERSIONS = (1, 2, 3)
 
 _REASON_MESSAGES = {
     "database_missing": "数据库尚未初始化",
@@ -140,7 +144,7 @@ class MetadataEntryStore:
 
 
 def _create_fresh_schema(conn: sqlite3.Connection) -> Metadata:
-    """空库直接创建 schema 3；不写 schema_history（没有发生迁移）。"""
+    """空库直接创建目标 schema；不写 schema_history（没有发生迁移）。"""
     schema_mod.create_schema(conn)
     MetadataEntryStore.create_table(conn)
     metadata = Metadata(
@@ -176,11 +180,12 @@ def initialize_database(settings: SettingsLike) -> Metadata:
         tables = table_names(conn)
         if METADATA_TABLE in tables:
             metadata = _read_metadata(conn)
-            if metadata.schema_version in (1, 2, SCHEMA_VERSION):
+            if metadata.schema_version in (*_MIGRATABLE_VERSIONS, SCHEMA_VERSION):
                 return metadata
             raise DatabaseError(
                 "schema_incompatible",
-                f"数据库 schema 版本为 {metadata.schema_version}，本应用支持 1/2（待迁移）或 {SCHEMA_VERSION}",
+                f"数据库 schema 版本为 {metadata.schema_version}，"
+                f"本应用支持 {', '.join(str(v) for v in _MIGRATABLE_VERSIONS)}（待迁移）或 {SCHEMA_VERSION}",
             )
         if tables:
             raise DatabaseError(
@@ -222,7 +227,7 @@ def check_database(settings: SettingsLike) -> DatabaseStatus:
         metadata = _read_metadata(conn)
         if metadata.schema_version == SCHEMA_VERSION:
             return DatabaseStatus(True, None, None, metadata)
-        if metadata.schema_version in (1, 2):
+        if metadata.schema_version in _MIGRATABLE_VERSIONS:
             return DatabaseStatus(
                 False,
                 "migration_required",
@@ -231,7 +236,8 @@ def check_database(settings: SettingsLike) -> DatabaseStatus:
             )
         raise DatabaseError(
             "schema_incompatible",
-            f"数据库 schema 版本为 {metadata.schema_version}，本应用支持 1/2（待迁移）或 {SCHEMA_VERSION}",
+            f"数据库 schema 版本为 {metadata.schema_version}，"
+            f"本应用支持 {', '.join(str(v) for v in _MIGRATABLE_VERSIONS)}（待迁移）或 {SCHEMA_VERSION}",
         )
     except DatabaseError as exc:
         return DatabaseStatus(False, exc.reason, str(exc), None)
@@ -273,10 +279,22 @@ def _migrate_2_to_3(conn: sqlite3.Connection, backup_path: str | None) -> None:
             " member_count=(SELECT COUNT(*) FROM data_version_member m"
             "   WHERE m.version_id=data_version.version_id), chunk_count=0"
         )
+        conn.execute(f"UPDATE {METADATA_TABLE} SET value='3' WHERE key='schema_version'")
+        conn.execute(
+            "INSERT INTO schema_history(from_version, to_version, applied_at, backup_path,"
+            " result, notes) VALUES (2, 3, ?, ?, 'success', 'explicit migration 2->3')",
+            (_utc_now(), backup_path),
+        )
+
+
+def _migrate_3_to_4(conn: sqlite3.Connection, backup_path: str | None) -> None:
+    """阶段三纯增量迁移 3→4：只新增对象，不改写任何既有行。"""
+    with conn:
+        schema_mod.create_schema_4(conn)
         conn.execute(f"UPDATE {METADATA_TABLE} SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
         conn.execute(
             "INSERT INTO schema_history(from_version, to_version, applied_at, backup_path,"
-            " result, notes) VALUES (2, ?, ?, ?, 'success', 'explicit migration 2->3')",
+            " result, notes) VALUES (3, ?, ?, ?, 'success', 'explicit migration 3->4')",
             (SCHEMA_VERSION, _utc_now(), backup_path),
         )
 
@@ -289,7 +307,7 @@ def migrate_database(
     convert_legacy: bool = True,
     reclaim_legacy: bool = False,
 ) -> dict:
-    """把 schema 1/2 显式升级为 schema 3；与导入共用写入锁。"""
+    """把 schema 1/2/3 显式升级为目标 schema；与导入共用写入锁。"""
     lock = DataWriteLock(settings.lock_dir / "data-write.lock", wait_seconds=30.0)
     lock.acquire()
     try:
@@ -338,10 +356,11 @@ def _migrate_locked(
                     raise MigrationInjectedFailure("injected failure after schema transaction")
                 update_run(side, run_id, state="completed", detail="already_migrated")
                 return {"status": "already_migrated", "schema_version": SCHEMA_VERSION}
-            if metadata.schema_version not in (1, 2):
+            if metadata.schema_version not in _MIGRATABLE_VERSIONS:
                 raise DatabaseError(
                     "schema_incompatible",
-                    f"数据库 schema 版本为 {metadata.schema_version}，只支持从 1/2 迁移",
+                    f"数据库 schema 版本为 {metadata.schema_version}，"
+                    f"只支持从 {', '.join(str(v) for v in _MIGRATABLE_VERSIONS)} 迁移",
                 )
             original_version = metadata.schema_version
             allowed_tables = {METADATA_TABLE}
@@ -363,6 +382,14 @@ def _migrate_locked(
                         "schema_incompatible",
                         "数据库包含非 schema 2 的表，拒绝自动改写: " + ", ".join(sorted(unknown)[:5]),
                     )
+            if metadata.schema_version == 3:
+                expected = set(_schema3_table_names())
+                unknown = [name for name in tables if name not in expected and name != "schema_history"]
+                if unknown:
+                    raise DatabaseError(
+                        "schema_incompatible",
+                        "数据库包含未知结构，拒绝自动改写: " + ", ".join(sorted(unknown)[:5]),
+                    )
             if fail_after_step == "after_metadata":
                 raise MigrationInjectedFailure("injected failure after metadata check")
 
@@ -376,18 +403,25 @@ def _migrate_locked(
             if fail_after_step == "after_verify_backup":
                 raise MigrationInjectedFailure("injected failure after backup verification")
 
-            if metadata.schema_version == 1:
+            if original_version == 1:
                 _migrate_1_to_2(conn, str(backup_db))
                 metadata = _read_metadata(conn)
-            _migrate_2_to_3(conn, str(backup_db))
+            if metadata.schema_version == 2:
+                _migrate_2_to_3(conn, str(backup_db))
+                metadata = _read_metadata(conn)
+            if metadata.schema_version == 3:
+                _migrate_3_to_4(conn, str(backup_db))
             if fail_after_step == "after_schema":
                 raise MigrationInjectedFailure("injected failure after schema transaction")
 
-            # 提交后恢复核对：结构、history、成员必须一致。
+            # 提交后恢复核对：本次迁移链必须留下准确 history（既有库此前未迁移的
+            # 区段不要求回填历史；阶段二整理期间新建的 schema 3 库本就没有 2->3 记录）。
             if original_version == 1 and not _history_exists(conn, 1, 2):
                 raise DatabaseError("migration_inconsistent", "缺少 1->2 迁移历史")
-            if not _history_exists(conn, 2, SCHEMA_VERSION):
+            if original_version in (1, 2) and not _history_exists(conn, 2, 3):
                 raise DatabaseError("migration_inconsistent", "缺少 2->3 迁移历史")
+            if not _history_exists(conn, 3, SCHEMA_VERSION):
+                raise DatabaseError("migration_inconsistent", "缺少 3->4 迁移历史")
             _check_integrity(conn)
             update_run(side, run_id, state="schema_committed")
         except MigrationInjectedFailure:
@@ -428,13 +462,27 @@ def _migrate_locked(
         side.close()
 
 
-def _schema2_table_names() -> list[str]:
-    names = ["app_metadata", "schema_history"]
-    for statement in schema_mod.SCHEMA_2_STATEMENTS:
+def _schema_statements_table_names(statements) -> list[str]:
+    names: list[str] = []
+    for statement in statements:
         text = statement.strip()
         if text.upper().startswith("CREATE TABLE "):
             names.append(text.split()[2])
     return names
+
+
+def _schema2_table_names() -> list[str]:
+    return ["app_metadata", "schema_history"] + _schema_statements_table_names(
+        schema_mod.SCHEMA_2_STATEMENTS
+    )
+
+
+def _schema3_table_names() -> list[str]:
+    return _schema2_table_names() + _schema_statements_table_names(schema_mod.SCHEMA_3_STATEMENTS)
+
+
+def _schema4_table_names() -> list[str]:
+    return _schema3_table_names() + list(schema_mod.PHASE3_TABLE_NAMES)
 
 
 def convert_legacy_members(settings: SettingsLike) -> list[dict]:

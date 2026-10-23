@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { getJson } from "./api";
+import { PortfolioPanel } from "./PortfolioPanel";
 import type { DataStatus, Health, Ready, SystemStatus } from "./types";
 
 type Tone = "ok" | "warn" | "error" | "neutral";
@@ -49,6 +50,7 @@ const FEATURE_STATUS: Record<string, { label: string; tone: Tone }> = {
   pending_check: { label: "待检查", tone: "warn" },
   partial_coverage: { label: "部分覆盖", tone: "warn" },
   limited: { label: "受限", tone: "warn" },
+  available: { label: "可用", tone: "ok" },
   available_in_range: { label: "范围内可用", tone: "ok" },
   migration_required: { label: "需要迁移", tone: "error" },
 };
@@ -61,8 +63,8 @@ const FEATURES: Array<{
   detail: string;
 }> = [
   { key: "market_data", label: "行情数据", detail: "阶段 2 建立数据接入与质量检查基础" },
-  { key: "account", label: "模拟账户", detail: "阶段 2 不创建账户，也不展示净值或收益" },
-  { key: "strategy", label: "策略与回测", detail: "尚未实现选股、调仓或回测逻辑" },
+  { key: "account", label: "持仓与模拟", detail: "阶段三提供个人持仓、模拟成交、公司行为与 NAV/收益" },
+  { key: "strategy", label: "组合建议", detail: "阶段三提供渐进调整与同资金独立推荐；不构成投资建议" },
   { key: "scheduler", label: "定时任务", detail: "尚未实现每日更新或每周调仓调度" },
   { key: "ai", label: "AI 分析与周报", detail: "未配置模型，也不作为本地启动依赖" },
 ];
@@ -481,19 +483,7 @@ export default function App() {
           </div>
         </section>
 
-        <section className="section" aria-labelledby="account-heading">
-          <div className="section-heading">
-            <h2 id="account-heading">账户与收益</h2>
-            <p>没有数据时不使用零值、示例持仓或虚构曲线填充页面。</p>
-          </div>
-          <div className="empty-state">
-            <p className="empty-title">暂无账户数据</p>
-            <p>
-              阶段 2 只建立数据接入与质量检查基础。模拟账户、持仓、成交和收益尚未实现，
-              因此这里不展示任何数值。
-            </p>
-          </div>
-        </section>
+        <PortfolioPanel />
 
         <section className="section" aria-labelledby="limits-heading">
           <div className="section-heading">
@@ -512,7 +502,7 @@ export default function App() {
       </main>
 
       <footer className="page-footer">
-        <span>阶段 1 · 本地基础</span>
+        <span>阶段 3 · 本地模拟核心</span>
         <span>{snapshot.health ? `后端 v${snapshot.health.version}` : "后端未连接"}</span>
         <span>仅用于本机开发与验证</span>
       </footer>

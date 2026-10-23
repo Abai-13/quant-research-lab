@@ -32,10 +32,11 @@ def _write_schema1_db(path: Path, *, instance_id: str = "legacy-instance") -> No
         )
 
 
-def test_new_database_is_created_as_schema_3(temp_settings: Settings) -> None:
+def test_new_database_is_created_as_target_schema(temp_settings: Settings) -> None:
     metadata = initialize_database(temp_settings)
 
-    assert metadata.schema_version == SCHEMA_VERSION == 3
+    # 阶段三起目标 schema 为 4（纯增量）：可写回关；既有 schema 2 断言保留结构名。
+    assert metadata.schema_version == SCHEMA_VERSION == 4
     assert metadata.instance_id
     assert metadata.created_at
     with sqlite3.connect(temp_settings.db_path) as conn:
@@ -67,7 +68,7 @@ def test_migration_preserves_instance_metadata_and_records_history(temp_settings
     result = migrate_database(temp_settings)
 
     assert result["status"] == "migrated"
-    assert result["schema_version"] == 3
+    assert result["schema_version"] == 4
     backup_path = Path(result["backup_path"])
     assert backup_path.is_file()
     assert (backup_path.parent / "backup-manifest.json").is_file()
@@ -77,7 +78,7 @@ def test_migration_preserves_instance_metadata_and_records_history(temp_settings
             "SELECT from_version, to_version, result, backup_path FROM schema_history"
             " ORDER BY id"
         ).fetchall()
-    assert rows["schema_version"] == "3"
+    assert rows["schema_version"] == "4"
     assert rows["instance_id"] == "legacy-instance"
     assert rows["created_at"] == "2024-01-01T00:00:00+00:00"
     assert history[0][0] == 1
@@ -157,7 +158,7 @@ def test_injected_failure_preserves_database_and_backup(temp_settings: Settings,
     with sqlite3.connect(temp_settings.db_path) as conn:
         rows = dict(conn.execute("SELECT key, value FROM app_metadata").fetchall())
     # after_schema 注入点位于事务提交之后：结构已升级，但备份与迁移历史可核对恢复。
-    expected_versions = {"3"} if stage == "after_schema" else {"1", "2"}
+    expected_versions = {"4"} if stage == "after_schema" else {"1", "2"}
     assert rows["schema_version"] in expected_versions
     assert temp_settings.db_path.exists()
     if stage not in {"before_integrity", "after_metadata"}:

@@ -21,6 +21,7 @@ from typing import Any
 
 from ..config import Settings
 from .quality import issue_counts_by_severity
+from .schema import SCHEMA_VERSION
 from .store import coverage_summary, latest_versions, version_count
 
 __all__ = ["data_status", "STATUS_VALUES"]
@@ -74,9 +75,11 @@ def data_status(settings: Settings) -> dict[str, Any]:
             "instance_id": metadata.get("instance_id"),
             "created_at": metadata.get("created_at"),
         }
-        if schema_version != 3:
+        if schema_version != SCHEMA_VERSION:
             base["status"] = "migration_required"
-            base["detail"] = f"数据库仍是 schema {schema_version}，需要先显式迁移到 schema 3"
+            base["detail"] = (
+                f"数据库仍是 schema {schema_version}，需要先显式迁移到 schema {SCHEMA_VERSION}"
+            )
             return base
 
         source_code = settings.data_source.source_code

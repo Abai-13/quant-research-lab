@@ -28,3 +28,25 @@ export async function getJson<T>(
   }
   return { status: response.status, ok: response.ok, body };
 }
+
+export async function postJson<T>(
+  path: string,
+  payload: unknown,
+): Promise<JsonResult<T>> {
+  const response = await fetch(path, {
+    method: "POST",
+    cache: "no-store",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const text = await response.text();
+  let body: T | null = null;
+  if (text.length > 0) {
+    try {
+      body = JSON.parse(text) as T;
+    } catch {
+      body = null;
+    }
+  }
+  return { status: response.status, ok: response.ok, body };
+}

@@ -78,9 +78,9 @@ def test_system_status_keeps_phase1_shape(data_settings: Settings) -> None:
         response = client.get("/api/system/status")
 
     body = response.json()
-    assert body["account"]["status"] == "not_initialized"
+    assert body["account"]["status"] == "available"
     assert body["account"]["net_value"] is None
-    assert body["strategy"]["status"] == "not_implemented"
+    assert body["strategy"]["status"] == "available"
     assert body["scheduler"]["status"] == "not_implemented"
     assert body["ai"]["status"] == "not_configured"
     assert body["market_data"]["status"]
