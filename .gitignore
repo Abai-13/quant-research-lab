@@ -5,12 +5,20 @@
 *.key
 *.pem
 
+# Local development plans and coordination records (never publish)
+/本地开发文档/
+/AGENTS.md
+/项目说明与开发方案.md
+/开发阶段计划.md
+/阶段*详细执行计划.md
+/docs/phase-*/
+
 # Runtime data and local artifacts
 .runtime/
-data/
-logs/
-backups/
-work/
+/data/
+/logs/
+/backups/
+/work/
 *.db
 *.db-*
 *.sqlite
@@ -39,3 +47,6 @@ playwright-report/
 .vscode/
 Thumbs.db
 .DS_Store
+
+# Local-only coordination material: never published, never part of a delivery commit
+本地开发文档/

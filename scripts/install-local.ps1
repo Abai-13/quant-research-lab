@@ -1,4 +1,4 @@
-# 阶段 1 本地依赖安装。只在本 worktree 内创建虚拟环境与 node_modules，不修改全局环境。
+﻿# 阶段 1 本地依赖安装。只在本 worktree 内创建虚拟环境与 node_modules，不修改全局环境。
 [CmdletBinding()]
 param()
 

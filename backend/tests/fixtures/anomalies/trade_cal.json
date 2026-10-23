@@ -1,0 +1,36 @@
+{
+ "interface": "trade_cal",
+ "max_rows": 6000,
+ "responses": [
+  {
+   "match": {
+    "exchange": "SSE"
+   },
+   "pages": [
+    {
+     "fields": [
+      "exchange",
+      "cal_date",
+      "is_open",
+      "pretrade_date"
+     ],
+     "items": [
+      [
+       "SSE",
+       "20240102",
+       "1",
+       ""
+      ],
+      [
+       "SSE",
+       "20240103",
+       "1",
+       "20240102"
+      ]
+     ],
+     "total": 2
+    }
+   ]
+  }
+ ]
+}

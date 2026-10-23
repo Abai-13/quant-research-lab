@@ -1,0 +1,126 @@
+{
+ "interface": "daily",
+ "max_rows": 6000,
+ "responses": [
+  {
+   "match": {
+    "ts_code": "000001.SZ"
+   },
+   "pages": [
+    {
+     "fields": [
+      "ts_code",
+      "trade_date",
+      "open",
+      "high",
+      "low",
+      "close",
+      "pre_close",
+      "vol",
+      "amount"
+     ],
+     "items": [
+      [
+       "000001.SZ",
+       "20240102",
+       10.0,
+       10.2,
+       9.9,
+       10.1,
+       10.0,
+       1000000,
+       1010000.0
+      ]
+     ],
+     "total": 1
+    }
+   ]
+  },
+  {
+   "match": {
+    "ts_code": "900010.SZ"
+   },
+   "pages": [
+    {
+     "error": {
+      "kind": "rate_limited",
+      "message": "每分钟最多访问该接口 500 次"
+     }
+    }
+   ]
+  },
+  {
+   "match": {
+    "ts_code": "900011.SZ"
+   },
+   "pages": [
+    {
+     "error": {
+      "kind": "no_permission",
+      "message": "抱歉，您没有访问该接口的权限"
+     }
+    }
+   ]
+  },
+  {
+   "match": {
+    "ts_code": "900012.SZ"
+   },
+   "pages": [
+    {
+     "error": {
+      "kind": "contract_error",
+      "message": "缺少字段 items"
+     }
+    }
+   ]
+  },
+  {
+   "match": {
+    "ts_code": "900013.SZ"
+   },
+   "pages": [
+    {
+     "error": {
+      "kind": "transport_error",
+      "message": "模拟超时"
+     }
+    }
+   ]
+  },
+  {
+   "match": {
+    "ts_code": "900014.SZ"
+   },
+   "pages": [
+    {
+     "fields": [
+      "ts_code",
+      "trade_date",
+      "open",
+      "high",
+      "low",
+      "close",
+      "pre_close",
+      "vol",
+      "amount"
+     ],
+     "items": [
+      [
+       "000001.SZ",
+       "20240102",
+       10.0,
+       10.2,
+       9.9,
+       10.1,
+       10.0,
+       1000000,
+       1010000.0
+      ]
+     ],
+     "total": 9
+    }
+   ]
+  }
+ ]
+}

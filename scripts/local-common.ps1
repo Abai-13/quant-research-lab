@@ -1,4 +1,4 @@
-# 由 install/start/stop 脚本 dot-source 的共享函数。
+﻿# 由 install/start/stop 脚本 dot-source 的共享函数。
 # 兼容 Windows PowerShell 5.1 与 PowerShell 7。
 
 Set-StrictMode -Version Latest

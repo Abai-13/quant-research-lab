@@ -1,0 +1,80 @@
+{
+ "interface": "stock_basic",
+ "max_rows": 6000,
+ "responses": [
+  {
+   "match": {
+    "list_status": "L"
+   },
+   "pages": [
+    {
+     "fields": [
+      "ts_code",
+      "symbol",
+      "name",
+      "market",
+      "exchange",
+      "list_date",
+      "delist_date",
+      "list_status"
+     ],
+     "items": [
+      [
+       "000001.SZ",
+       "000001",
+       "示例银行A",
+       "主板",
+       "SZSE",
+       "19910403",
+       "",
+       "L"
+      ],
+      [
+       "900002.SZ",
+       "900002",
+       "示例后上市B",
+       "主板",
+       "SZSE",
+       "20240301",
+       "",
+       "L"
+      ]
+     ],
+     "total": 2
+    }
+   ]
+  },
+  {
+   "match": {
+    "list_status": "D"
+   },
+   "pages": [
+    {
+     "fields": [
+      "ts_code",
+      "symbol",
+      "name",
+      "market",
+      "exchange",
+      "list_date",
+      "delist_date",
+      "list_status"
+     ],
+     "items": [
+      [
+       "900003.SZ",
+       "900003",
+       "示例已退市C",
+       "主板",
+       "SZSE",
+       "19910129",
+       "20240103",
+       "D"
+      ]
+     ],
+     "total": 1
+    }
+   ]
+  }
+ ]
+}
