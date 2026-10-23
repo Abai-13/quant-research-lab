@@ -240,6 +240,7 @@ def _seed(conn, days: list[str]) -> dict[str, Any]:
         )
     return {
         "account_id": DEMO_ACCOUNT_ID,
+        "source_code": DEMO_SOURCE,
         "version_id": version_id,
         "pool_snapshot_id": str(pool["snapshot_id"]),
         "as_of": days[-1],
@@ -287,6 +288,7 @@ def ensure_demo_database(settings: Settings) -> dict[str, Any]:
                 raise RuntimeError(f"demo metadata incomplete: {missing}")
             info = {
                 "account_id": DEMO_ACCOUNT_ID,
+                "source_code": DEMO_SOURCE,
                 "version_id": str(meta["demo_version_id"]),
                 "pool_snapshot_id": str(meta["demo_pool_snapshot_id"]),
                 "as_of": str(meta["demo_as_of"]),

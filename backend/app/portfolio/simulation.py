@@ -1090,6 +1090,7 @@ def create_simulation_segment(
     source_code: str,
     data_version_id: str,
     as_of: str,
+    simulation_run_key: str | None = None,
 ) -> dict[str, Any]:
     """从显式选择的已持久化账户快照创建（或复用）一个模拟段。
 
@@ -1098,6 +1099,16 @@ def create_simulation_segment(
     """
     if not isinstance(source_account_id, str) or not source_account_id.strip():
         raise DataError("s5_source_account_required", "必须显式提供源实际账户 account_id")
+    if simulation_run_key is not None:
+        if (
+            not isinstance(simulation_run_key, str)
+            or not simulation_run_key.strip()
+            or len(simulation_run_key) > 120
+        ):
+            raise DataError(
+                "s5_simulation_run_key_invalid",
+                "simulation_run_key 必须是 1 到 120 字符的非空白字符串",
+            )
     as_of = _require_yyyymmdd(as_of, "s5_as_of_invalid")
     source_row = conn.execute(
         "SELECT kind FROM account WHERE account_id=?", (source_account_id,)
@@ -1166,6 +1177,10 @@ def create_simulation_segment(
         "data_version_id": data_version_id,
         "as_of": as_of,
     }
+    if simulation_run_key is not None:
+        # Optional client idempotency namespace. It does not provide resumable
+        # exercise identity or lifecycle management.
+        input_payload["simulation_run_key"] = simulation_run_key
     input_sha256 = sha256_of_object(input_payload)
     existing = conn.execute(
         "SELECT segment_id, simulation_account_id, status FROM simulation_segment"

@@ -55,6 +55,7 @@ def test_offline_demo_is_isolated_and_supports_recommendation_and_simulation(
         info = client.get("/api/portfolio/demo/bootstrap").json()
         assert info["ok"] is True and info["synthetic_demo"] is True
         assert info["account_id"] == "demo_actual"
+        assert info["source_code"] == "tushare-fixture"
         assert client.get("/api/portfolio/accounts/demo_actual").status_code == 400
         demo_state = client.get("/api/portfolio/accounts/demo_actual?demo=true")
         assert demo_state.status_code == 200

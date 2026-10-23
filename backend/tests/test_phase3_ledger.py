@@ -966,6 +966,10 @@ def test_payload_level_validation_rejections(portfolio_conn) -> None:
     _expect("opening_position_invalid", {"cash_cents": 10, "positions": ["x"]})
     _expect("ledger_field_out_of_range", {"cash_cents": 10,
                                          "positions": _positions_payload(shares=0)})
+    _expect("ledger_field_out_of_range", {"cash_cents": 10,
+                                         "positions": _positions_payload(shares=-1)})
+    _expect("ledger_field_not_integer", {"cash_cents": 10,
+                                         "positions": _positions_payload(shares=1.5)})
 
     # 买卖缺费用：fail-closed（缺证据不得推导现金变动）。
     _expect(

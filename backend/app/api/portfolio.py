@@ -316,6 +316,7 @@ def create_portfolio_router() -> APIRouter:
                     source_code=str(body.get("source_code", "")),
                     data_version_id=str(body.get("data_version_id", "")),
                     as_of=str(body.get("as_of", "")),
+                    simulation_run_key=body.get("simulation_run_key"),
                 )
             return {"ok": True, **result, "synthetic_demo": demo}
         finally:

@@ -288,6 +288,7 @@ def _segment(
     rules_version: str | None = None,
     rules: dict | None = None,
     fee_bundle_id: str | None = None,
+    simulation_run_key: str | None = None,
 ) -> str:
     rule_bundle_id = (
         _market_rules_bundle(conn, version=rules_version, rules=rules)
@@ -303,7 +304,49 @@ def _segment(
         source_code=SRC,
         data_version_id=env["version_id"],
         as_of=env["as_of"],
+        **({"simulation_run_key": simulation_run_key} if simulation_run_key is not None else {}),
     )
+
+
+def test_simulation_run_key_namespaces_segments_without_changing_legacy_idempotency(
+    portfolio_conn,
+) -> None:
+    conn, _settings = portfolio_conn
+    env = _env(conn)
+    env["snapshot_id"] = _snapshot_lookup(conn, env["account_id"])
+    legacy_first = _segment(conn, env)
+    legacy_replay = _segment(conn, env)
+    keyed_first = _segment(conn, env, simulation_run_key="exercise-a")
+    keyed_replay = _segment(conn, env, simulation_run_key="exercise-a")
+    keyed_second = _segment(conn, env, simulation_run_key="exercise-b")
+
+    assert legacy_replay["segment_id"] == legacy_first["segment_id"]
+    assert keyed_replay["segment_id"] == keyed_first["segment_id"]
+    assert keyed_replay["reused"] is True
+    assert keyed_first["segment_id"] != legacy_first["segment_id"]
+    assert keyed_second["segment_id"] != keyed_first["segment_id"]
+    assert keyed_second["simulation_account_id"] != keyed_first["simulation_account_id"]
+    assert conn.execute("SELECT COUNT(*) FROM simulation_event").fetchone()[0] == 3
+    assert get_account_state(conn, env["account_id"])["revision"] == env["state"]["revision"]
+
+
+@pytest.mark.parametrize("run_key", [1, True, "", "  ", "x" * 121])
+def test_simulation_run_key_rejects_invalid_values(portfolio_conn, run_key) -> None:
+    conn, _settings = portfolio_conn
+    env = _env(conn)
+    env["snapshot_id"] = _snapshot_lookup(conn, env["account_id"])
+    with pytest.raises(DataError, match="simulation_run_key"):
+        create_simulation_segment(
+            conn,
+            source_account_id=env["account_id"],
+            base_account_snapshot_id=env["snapshot_id"],
+            rule_bundle_id=env["rule_bundle_id"],
+            fee_bundle_id=env["fee_bundle_id"],
+            source_code=SRC,
+            data_version_id=env["version_id"],
+            as_of=env["as_of"],
+            simulation_run_key=run_key,
+        )
 
 
 def _env(
