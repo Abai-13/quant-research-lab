@@ -232,7 +232,7 @@ export function PortfolioPanel() {
         account_id: accountId,
         display_name: displayName,
       });
-      if (!created.ok) throw new Error(`创建账户失败：${JSON.stringify(created.body)}`);
+      if (!created.ok) throw new Error(`创建账户失败（HTTP ${created.status}），请稍后重试。`);
       const opening = {
         event_type: "opening",
         business_date: asOf || "20250301",
@@ -244,7 +244,7 @@ export function PortfolioPanel() {
         expected_account_revision: 0,
       };
       const posted = await postJson(`/api/portfolio/accounts/${accountId}/events`, opening);
-      if (!posted.ok) throw new Error(`期初保存失败：${JSON.stringify(posted.body)}`);
+      if (!posted.ok) throw new Error(`期初保存失败（HTTP ${posted.status}），请稍后重试。`);
       const loaded = await getJson<{ state: { cash_cents: number; positions: SimPosition[] } }>(
         `/api/portfolio/accounts/${accountId}`, new AbortController().signal,
       );
@@ -268,7 +268,7 @@ export function PortfolioPanel() {
         as_of: asOf, data_version_id: versionId, pool_snapshot_id: poolId || null,
         rule_bundle_id: parameterBundle, fee_bundle_id: feeBundle, mode,
       });
-      if (!response.ok || !response.body) throw new Error(`生成建议失败：${JSON.stringify(response.body)}`);
+      if (!response.ok || !response.body) throw new Error(`生成建议失败（HTTP ${response.status}），请稍后重试。`);
       setRecommendation(response.body);
       setMessage(`建议已生成：${response.body.run_id}`);
     } catch (error) {
@@ -291,7 +291,7 @@ export function PortfolioPanel() {
       };
       setSimulationRunDraft(draft);
       const response = await postJson<{ segment_id: string }>("/api/portfolio/simulation/segments", draft);
-      if (!response.ok || !response.body) throw new Error(`创建模拟段失败：${JSON.stringify(response.body)}`);
+      if (!response.ok || !response.body) throw new Error(`创建模拟段失败（HTTP ${response.status}），请稍后重试。`);
       setSegmentId(response.body.segment_id);
       setSimulationRunDraft(null);
       await refreshSimulationFor(response.body.segment_id);
@@ -330,7 +330,7 @@ export function PortfolioPanel() {
       const response = await postJson("/api/portfolio/simulation/segments/" + segmentId + "/orders", {
         ...draft,
       });
-      if (!response.ok) throw new Error(`下单失败：${JSON.stringify(response.body)}`);
+      if (!response.ok) throw new Error(`下单失败（HTTP ${response.status}），请稍后重试。`);
       clearOrderDraft(segmentId);
       await refreshSimulationFor(segmentId);
       setMessage("订单已提交；当前仅登记待处理订单，没有推进日期。实际账户未被修改。");
@@ -349,7 +349,7 @@ export function PortfolioPanel() {
       const response = await postJson(`/api/portfolio/simulation/segments/${segmentId}/advance`, {
         demo: Boolean(demo), on_trade_date: tradeDate,
       });
-      if (!response.ok) throw new Error(`推进失败：${JSON.stringify(response.body)}`);
+      if (!response.ok) throw new Error(`推进失败（HTTP ${response.status}），请稍后重试。`);
       await refreshSimulationFor(segmentId);
       setMessage("已处理至指定交易日；即使没有待处理订单也可推进。实际账户未被修改。");
     } catch (error) {
@@ -367,7 +367,7 @@ export function PortfolioPanel() {
       const response = await postJson(`/api/portfolio/simulation/segments/${segmentId}/close`, {
         demo: Boolean(demo), reason: "user_closed_from_portfolio_panel",
       });
-      if (!response.ok) throw new Error(`结束模拟失败：${JSON.stringify(response.body)}`);
+      if (!response.ok) throw new Error(`结束模拟失败（HTTP ${response.status}），请稍后重试。`);
       await refreshSimulationFor(segmentId);
       setMessage("模拟运行已结束，后端将拒绝后续订单。");
     } catch (error) {

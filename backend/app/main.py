@@ -11,19 +11,25 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
 from . import DISPLAY_NAME, MODE, SERVICE_NAME, __version__
 from .api.portfolio import create_portfolio_router
+from .api.practice import create_practice_router
 from .config import Settings, load_settings
 from .data.errors import DataError
 from .data.status import data_status
 from .db import DatabaseStatus, check_database, initialize_database
+from .practice.core import PracticeError
 
 logger = logging.getLogger("app.main")
 
 LIMITATIONS = [
     "阶段三已实现本地个人持仓、组合建议、模拟成交、公司行为与 NAV/收益；不接券商、不自动下单。",
+    "阶段四提供隔离的历史练习、显式逐日推进、四路对照与复盘；练习写入 <运行目录>/practice，与个人主库分离。",
+    "练习行情刷新只由显式 POST 请求触发；BaoStock 商用/再分发许可、完整股票池、历史交易资格与复杂公司行为仍未确认。",
     "离线演示使用独立合成数据库，页面始终标注合成数据；不会写入个人账户或真实行情。",
     "未实现登录与公网访问保护，服务默认只监听本机回环地址。",
     "页面中的功能状态来自后端接口，不代表策略有效或能够盈利；费用/滑点/涨跌停均为版本化模拟假设。",
@@ -80,7 +86,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             content={"ok": False, "reason": exc.reason, "detail": str(exc)},
         )
 
+    @app.exception_handler(PracticeError)
+    async def practice_error_handler(request: Request, exc: PracticeError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"ok": False, "reason": exc.reason, "detail": str(exc)},
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={"ok": False, "reason": "request_invalid", "detail": jsonable_encoder(exc.errors())},
+        )
+
     app.include_router(create_portfolio_router())
+    app.include_router(create_practice_router())
 
     @app.get("/api/health")
     def health() -> dict:

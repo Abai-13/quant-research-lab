@@ -1,0 +1,14 @@
+# 阶段四练习数据：独立可选依赖（不装也能跑）
+#
+# 只有在需要通过 POST /api/practice/data/refresh 从真实源（BaoStock）
+# 取数时才安装；离线合成样本与全部 GET 接口不依赖本清单。
+# 安装方式（自行选择环境，不要写入 main 依赖）：
+#   python -m pip install -r backend/requirements-practice-data.txt
+#
+# 核验记录（2026-10-24，独立临时 venv 完成真实小样本）：
+#   baostock 0.9.4 + 其自带 pandas 3.1.0 → sh.600000 日线
+#   2024-07-01..07-05 与官方文档字段契约一致（见
+#   D:/AI 量化模拟交易系统/本地开发文档/docs/phase-4/data/ 交接报告）。
+# 客户端免费/开源许可不等于行情数据商用/再分发许可，安装前知悉来源限定。
+
+baostock==0.9.4
