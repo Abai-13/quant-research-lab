@@ -9,6 +9,7 @@ import type {
 import { formatDate, isFinished } from "./format";
 import { NewPracticeForm } from "./NewPracticeForm";
 import { EmptyState, Notice, SectionHeading, StatusBadge, sourceLabel, type Tone } from "./ui";
+import { AgentPanel } from "./AgentPanel";
 
 function summaryMeta(session: PracticeSummary): string {
   const parts = [formatDate(session.start_date), formatDate(session.end_date)];
@@ -58,6 +59,8 @@ export function HomeView({
   onReloadOptions: () => void;
 }) {
   const [restartTarget, setRestartTarget] = useState<PracticeSummary | null>(null);
+  const [setupDraft, setSetupDraft] = useState<Record<string, unknown> | null>(null);
+  const [setupDraftApplied, setSetupDraftApplied] = useState(false);
   const runningCount = sessions.filter((session) => !isFinished(session.status)).length;
   const lastSession =
     sessions.find((session) => session.practice_id === lastSessionId) ?? sessions[0] ?? null;
@@ -67,10 +70,10 @@ export function HomeView({
     <div className="practice-home">
       <section className="practice-hero">
         <div className="practice-hero-copy">
-          <p className="eyebrow">历史练习 · 阶段 4</p>
-          <h1>用当时能看到的信息，练习一次完整决策</h1>
+          <p className="eyebrow">历史模拟 · Agent 任务工作台</p>
+          <h1>围绕一段历史模拟，查证目标并核对结果</h1>
           <p className="practice-hero-lead">
-            新建一段历史区间，查看当时行情，自主下单，再逐日揭晓结果。系统提供三条对照路径与一份可核对复盘，
+            创建或继续历史模拟，查看当时行情、自主下单并逐日揭晓。Agent 可按你的目标查证与整理，系统对照和模拟报告保留数据限制，
             不保证任何算法胜出，也不接入真实资金。
           </p>
           <div className="practice-hero-actions">
@@ -81,17 +84,17 @@ export function HomeView({
                 disabled={busy}
                 onClick={() => onOpen(lastSession.practice_id)}
               >
-                {isResume ? "继续上次练习" : "继续最近练习"}
+                {isResume ? "继续上次模拟" : "继续最近模拟"}
               </button>
             ) : null}
             <a className="practice-secondary-link" href="#new-practice-heading">
-              新建练习
+              创建模拟
             </a>
           </div>
         </div>
         <dl className="practice-hero-stats">
           <div>
-            <dt>练习记录</dt>
+            <dt>模拟记录</dt>
             <dd>{sessions.length}</dd>
           </div>
           <div>
@@ -105,10 +108,17 @@ export function HomeView({
         </dl>
       </section>
 
-      <section className="practice-steps" aria-label="练习流程">
+      <AgentPanel onSetupDraft={(payload) => {
+        setSetupDraft(payload);
+        setSetupDraftApplied(true);
+        window.setTimeout(() => document.getElementById("new-practice-heading")?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
+      }} />
+      {setupDraftApplied ? <Notice tone="ok">Agent 条件草稿已填入创建模拟表单。请检查日期、资金、数据版本和持仓后再手动创建。</Notice> : null}
+
+      <section className="practice-steps" aria-label="历史模拟流程">
         <div>
           <span className="practice-step-number">1</span>
-          <p>新建练习并设定起点</p>
+          <p>创建模拟并设定起点</p>
         </div>
         <div>
           <span className="practice-step-number">2</span>
@@ -120,7 +130,7 @@ export function HomeView({
         </div>
         <div>
           <span className="practice-step-number">4</span>
-          <p>结束并复盘，随时重开</p>
+          <p>结束并查看模拟报告</p>
         </div>
       </section>
 
@@ -148,34 +158,35 @@ export function HomeView({
         creating={creating}
         onCreate={onCreate}
         onPrepareDemo={onPrepareDemo}
+        setupDraft={setupDraft}
       />
 
       <section className="section" aria-labelledby="history-heading">
         <SectionHeading
           id="history-heading"
-          title="报告历史"
+          title="历史模拟"
           actions={
             <button type="button" className="refresh-button" onClick={onRefreshSessions} disabled={sessionsLoading}>
               {sessionsLoading ? "读取中…" : "刷新列表"}
             </button>
           }
         >
-          每个练习都有独立身份和记录；重开会创建新的身份，旧练习与报告继续保留。
+          每段模拟都有独立身份；重开会创建新的模拟，旧记录与模拟报告继续保留。
         </SectionHeading>
 
         {sessionsError ? (
-          <Notice tone="error" title="读取练习列表失败">
+          <Notice tone="error" title="读取历史模拟失败">
             {sessionsError}
           </Notice>
         ) : null}
 
         {sessionsLoading && sessions.length === 0 ? (
           <div className="empty-state">
-            <p className="empty-title">正在读取练习记录…</p>
+            <p className="empty-title">正在读取模拟记录…</p>
           </div>
         ) : sessions.length === 0 ? (
-          <EmptyState title="还没有练习记录">
-            用上方表单创建第一个历史练习。没有数据时可先准备合成示例，不会写入真实数据。
+          <EmptyState title="还没有历史模拟">
+            用上方表单创建第一段历史模拟。没有数据时可先准备合成示例，不会写入真实数据。
           </EmptyState>
         ) : (
           <div className="practice-session-list">
@@ -202,7 +213,7 @@ export function HomeView({
                     disabled={busy}
                     onClick={() => onOpen(session.practice_id)}
                   >
-                    {isFinished(session.status) ? "查看复盘" : "继续练习"}
+                    {isFinished(session.status) ? "查看模拟报告" : "继续模拟"}
                   </button>
                   <button
                     type="button"
@@ -210,13 +221,13 @@ export function HomeView({
                     disabled={busy}
                     onClick={() => setRestartTarget(session)}
                   >
-                    重开
+                    重新创建
                   </button>
                 </div>
                 {restartTarget?.practice_id === session.practice_id ? (
-                  <div className="practice-confirm" role="group" aria-label="确认重开练习">
+                  <div className="practice-confirm" role="group" aria-label="确认重新创建模拟">
                     <p>
-                      将基于同一段设置创建一个全新的练习身份，旧练习和报告会保留。确认重开吗？
+                      将基于同一段设置创建一个新的模拟身份，旧记录与报告会保留。确认继续吗？
                     </p>
                     <div className="practice-confirm-actions">
                       <button
@@ -231,7 +242,7 @@ export function HomeView({
                           }
                         }}
                       >
-                        确认重开
+                        确认重新创建
                       </button>
                       <button type="button" className="link-button" onClick={() => setRestartTarget(null)}>
                         取消
@@ -245,14 +256,6 @@ export function HomeView({
         )}
       </section>
 
-      <section className="section practice-phase5-note" aria-label="后续阶段说明">
-        <div>
-          <h2>Agent 对话将在阶段 5 接入</h2>
-          <p className="muted">
-            本阶段所有建议与交易都由你确认；页面不展示模拟的聊天、工具进度或自动交易。
-          </p>
-        </div>
-      </section>
     </div>
   );
 }

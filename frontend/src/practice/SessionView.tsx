@@ -168,7 +168,7 @@ export function SessionView({
     <div className="practice-session">
       <div className="practice-session-topbar">
         <button type="button" className="link-button" onClick={onBack}>
-          ← 返回练习首页
+          ← 返回历史模拟
         </button>
         <div className="practice-session-top-actions">
           <button type="button" className="refresh-button" onClick={onRefresh} disabled={Boolean(busy)}>
@@ -180,14 +180,14 @@ export function SessionView({
             disabled={Boolean(busy)}
             onClick={() => setConfirmAction("restart")}
           >
-            重开练习
+            重新创建模拟
           </button>
         </div>
       </div>
 
       <header className="practice-session-header">
         <div>
-          <p className="eyebrow">历史练习</p>
+          <p className="eyebrow">历史模拟</p>
           <h1>{session.name}</h1>
           <div className="practice-session-tags">
             <StatusBadge status={session.status} />
@@ -244,8 +244,8 @@ export function SessionView({
       </div>
 
       {finished ? (
-        <Notice tone="neutral" title="练习已结束">
-          当前记录与报告可读；不再接受新订单、推进或新决策。可在上方“重开练习”创建新身份。
+        <Notice tone="neutral" title="模拟已结束">
+          当前记录与模拟报告可读；不再接受新订单、推进或新决策。可在上方重新创建一段新模拟。
         </Notice>
       ) : null}
 
@@ -416,7 +416,7 @@ export function SessionView({
                 disabled={finished || Boolean(busy)}
                 onClick={() => setConfirmAction("finish")}
               >
-                结束练习并生成复盘
+                结束模拟并生成复盘
               </button>
             </div>
             <p className="practice-field-hint">
@@ -443,8 +443,8 @@ export function SessionView({
       ) : null}
 
       {confirmAction === "finish" ? (
-        <div className="practice-confirm practice-confirm-wide" role="group" aria-label="确认结束练习">
-          <p>将在当前揭晓日结束练习并生成报告，之后不能再交易或推进。持仓不会被强制卖出。</p>
+        <div className="practice-confirm practice-confirm-wide" role="group" aria-label="确认结束模拟">
+          <p>将在当前揭晓日结束模拟并生成模拟报告，之后不能再交易或推进。持仓不会被强制卖出。</p>
           <div className="practice-confirm-actions">
             <button
               type="button"
@@ -465,8 +465,8 @@ export function SessionView({
       ) : null}
 
       {confirmAction === "restart" ? (
-        <div className="practice-confirm practice-confirm-wide" role="group" aria-label="确认重开练习">
-          <p>将基于同一设置创建全新的练习身份，旧练习与报告保留。确认重开吗？</p>
+        <div className="practice-confirm practice-confirm-wide" role="group" aria-label="确认重新创建模拟">
+          <p>将基于同一设置创建新的模拟身份，旧记录与报告保留。确认重新创建吗？</p>
           <div className="practice-confirm-actions">
             <button
               type="button"
@@ -556,7 +556,7 @@ export function SessionView({
       {finished ? (
         <section className="section" aria-labelledby="report-heading">
           <SectionHeading id="report-heading" title="复盘报告">
-            报告历史可在练习首页重新打开；结束不强制卖出，未知估值保持为空。
+            报告历史可在历史模拟首页重新打开；结束不强制卖出，未知估值保持为空。
           </SectionHeading>
           <ReportView
             report={report}

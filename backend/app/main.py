@@ -10,7 +10,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
@@ -18,6 +18,9 @@ from fastapi.responses import JSONResponse
 from . import DISPLAY_NAME, MODE, SERVICE_NAME, __version__
 from .api.portfolio import create_portfolio_router
 from .api.practice import create_practice_router
+from .api.agent import create_agent_router
+from .agent_runtime.manager import AgentTaskManager
+from .agent_runtime.store import AgentStore
 from .config import Settings, load_settings
 from .data.errors import DataError
 from .data.status import data_status
@@ -56,8 +59,10 @@ def _database_payload(status: DatabaseStatus) -> dict:
     }
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, *, agent_gateway=None, agent_tools=None) -> FastAPI:
     resolved = settings or load_settings()
+    agent_store = AgentStore(resolved.runtime_dir / "agent" / "tasks.sqlite3")
+    agent_manager = AgentTaskManager(resolved, agent_store, agent_gateway, agent_tools)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -69,7 +74,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             reason = getattr(exc, "reason", "database_unavailable")
             app.state.startup_database_error = reason
             logger.warning("数据库初始化未完成（%s），服务继续启动但 readiness 将返回未就绪", reason)
-        yield
+        try:
+            agent_store.initialize()
+        except Exception as exc:  # Agent 存储故障不应中断既有手动模拟API
+            app.state.agent_storage_error = getattr(exc, "reason", "agent_storage_unavailable")
+            logger.warning("Agent任务存储不可用（%s）", app.state.agent_storage_error)
+        try:
+            yield
+        finally:
+            await agent_manager.shutdown()
 
     app = FastAPI(
         title=DISPLAY_NAME,
@@ -77,6 +90,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         description="阶段 1 本地基础状态服务",
         lifespan=lifespan,
     )
+    app.state.agent_store = agent_store
+    app.state.agent_manager = agent_manager
+    app.state.agent_gateway = agent_gateway
 
     @app.exception_handler(DataError)
     async def data_error_handler(request: Request, exc: DataError) -> JSONResponse:
@@ -97,11 +113,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def request_validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
         return JSONResponse(
             status_code=422,
-            content={"ok": False, "reason": "request_invalid", "detail": jsonable_encoder(exc.errors())},
+            content={"ok": False, "reason": "request_invalid", "detail": "Invalid Agent request."}
+            if request.url.path.startswith("/api/agent")
+            else {"ok": False, "reason": "request_invalid", "detail": jsonable_encoder(exc.errors())},
         )
+
+    @app.exception_handler(HTTPException)
+    async def http_error_handler(request: Request, exc: HTTPException) -> JSONResponse:
+        if request.url.path.startswith("/api/agent") and isinstance(exc.detail, dict) and exc.detail.get("ok") is False:
+            return JSONResponse(status_code=exc.status_code, content=exc.detail, headers=exc.headers)
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
 
     app.include_router(create_portfolio_router())
     app.include_router(create_practice_router())
+    app.include_router(create_agent_router(resolved, agent_store, agent_manager, agent_gateway, agent_tools))
 
     @app.get("/api/health")
     def health() -> dict:
@@ -223,8 +248,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
             "strategy": {"status": "available"},
             "scheduler": {"status": "not_implemented"},
-            "ai": {"status": "not_configured"},
+            "ai": _ai_status(request.app.state.settings, request.app.state.agent_gateway),
             "limitations": LIMITATIONS,
         }
 
     return app
+
+
+def _ai_status(settings: Settings, gateway=None) -> dict:
+    """Expose only real public provider configuration state; never secret material."""
+    try:
+        if gateway is None:
+            from .agent_gateway import get_public_config
+        else:
+            get_public_config = gateway.get_public_config
+        value = get_public_config(settings)
+        return {"status": "configured" if value.get("configured") else "not_configured"}
+    except ImportError:
+        return {"status": "unavailable"}
+    except Exception:
+        return {"status": "unavailable"}

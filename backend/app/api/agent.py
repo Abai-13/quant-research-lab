@@ -1,0 +1,242 @@
+"""Frozen /api/agent task and configuration API; no implicit test provider."""
+from __future__ import annotations
+
+import hashlib
+import asyncio
+import importlib
+import json
+import re
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, ConfigDict, Field
+
+from ..agent_runtime.manager import AgentTaskManager
+from ..agent_runtime.store import ActiveTaskError, AgentStore, IdempotencyConflict, canonical
+from ..config import Settings
+
+
+class ConfigBody(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    name:str=Field(min_length=1,max_length=80)
+    protocol:str
+    base_url:str=Field(max_length=2_048)
+    model:str=Field(min_length=1,max_length=200)
+    api_key:str|None=Field(default=None,max_length=4_000)
+    expected_config_version:str|None=None
+    allow_loopback_http:bool=False
+    trusted_private_https:bool=False
+    limits:dict[str,Any]|None=None
+
+class TestBody(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    config_version:str
+    consent:bool
+    test_tools:bool
+
+class TaskBody(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    practice_id:str|None
+    expected_revision:int|None=None
+    goal:str=Field(min_length=1,max_length=8_000)
+    config_version:str
+    consent:bool
+    consent_digest:str=Field(min_length=64,max_length=64)
+    idempotency_key:str=Field(min_length=8,max_length=160)
+    limits:dict[str,Any]|None=None
+    parent_task_id:str|None=None
+
+class CancelBody(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    idempotency_key:str=Field(min_length=8,max_length=160)
+
+
+def _service(name:str)->Any:
+    try:return importlib.import_module(name)
+    except ImportError: raise HTTPException(503,detail={"ok":False,"reason":"agent_service_unavailable","detail":"Agent gateway or tools service is unavailable."}) from None
+
+def _failure(exc:Exception, reason:str, status:int=400)->HTTPException:
+    candidate=str(getattr(exc,"reason",reason))
+    safe_reason=candidate if re.fullmatch(r"[a-z][a-z0-9_]{0,79}",candidate) else reason
+    return HTTPException(status_code=int(getattr(exc,"status_code",status)),detail={"ok":False,"reason":safe_reason,"detail":reason.replace("_"," ")[:200]})
+
+def _public_config(gateway:Any,settings:Settings)->dict[str,Any]:
+    return gateway.get_public_config(settings)
+
+def _config_payload(config_result:dict[str,Any])->tuple[str,dict[str,Any]]:
+    config=config_result.get("config")
+    if not config_result.get("configured") or not isinstance(config,dict):
+        raise HTTPException(409,detail={"ok":False,"reason":"agent_not_configured","detail":"Configure an Agent provider first."})
+    return str(config.get("config_version") or ""),config
+
+def _disclosure(settings:Settings,gateway:Any,tools:Any,practice_id:str|None,expected_revision:int|None,limits_override:dict[str,Any]|None=None)->tuple[dict[str,Any],dict[str,Any]]:
+    try:
+        public=_public_config(gateway,settings); config_version,config=_config_payload(public)
+        context=tools.capture_context(settings,practice_id,expected_revision)
+        tools.validate_context(settings,context)
+        if not isinstance(context,dict) or context.get("scope") not in {"setup","simulation"}:
+            raise ValueError("context_invalid")
+        if context.get("practice_id")!=practice_id or (context.get("scope")=="setup")!=(practice_id is None):
+            raise ValueError("context_invalid")
+        if not isinstance(context.get("context_fingerprint"),str) or not context["context_fingerprint"]:
+            raise ValueError("context_invalid")
+    except HTTPException:raise
+    except Exception as exc: raise _failure(exc,"context_unavailable",409) from None
+    limits={"rounds":8,"tool_calls":20,"timeout_seconds":120,"tokens":4_096}
+    hard_limits={"rounds":8,"tool_calls":20,"timeout_seconds":120,"tokens":8_192}
+    configured=config.get("limits")
+    if isinstance(configured,dict):
+        for k in limits:
+            if k not in configured:continue
+            value=configured[k]
+            if not isinstance(value,(int,float)) or isinstance(value,bool) or value<=0 or (k!="timeout_seconds" and int(value)!=value):
+                raise HTTPException(503,detail={"ok":False,"reason":"config_limits_invalid","detail":"Configured runtime limits are invalid."})
+            limits[k]=min(hard_limits[k],value)
+    if limits_override:
+        for k,v in limits_override.items():
+            if k not in limits or not isinstance(v,(int,float)) or isinstance(v,bool):
+                raise HTTPException(422,detail={"ok":False,"reason":"limits_invalid","detail":"Only bounded runtime limits are accepted."})
+            if v<=0 or (k!="timeout_seconds" and int(v)!=v):
+                raise HTTPException(422,detail={"ok":False,"reason":"limits_invalid","detail":"Runtime limits must be positive and count limits must be integers."})
+            limits[k]=min(limits[k],v)
+    target={"base_url":config.get("base_url"),"model":config.get("model"),"name":config.get("name")}
+    categories=["user_goal","current_simulation_context","tool_evidence","generated_drafts"]
+    binding={"config_version":config_version,"target":target,"context_fingerprint":context.get("context_fingerprint"),
+             "practice_id":context.get("practice_id"),"revision":context.get("revision"),"revealed_date":context.get("revealed_date"),
+             "data_version_id":context.get("data_version_id"),"data_categories":categories,"limits":limits}
+    consent_digest=hashlib.sha256(canonical(binding).encode("utf-8")).hexdigest()
+    disclosure={"config_version":config_version,"target":target,"context":{k:context.get(k) for k in
+        ("scope","practice_id","revision","revealed_date","data_version_id","source_code","context_fingerprint","limitations")},
+        "data_categories":categories,"purpose":"Research assistance for the bound historical simulation; evidence and drafts only.",
+        "possible_cost":True,"limits":limits,"consent_digest":consent_digest}
+    return disclosure,context
+
+def _lower_limits(base:dict[str,Any],override:dict[str,Any]|None)->dict[str,Any]:
+    result=dict(base)
+    if override is None:return result
+    for key,value in override.items():
+        if key not in result or not isinstance(value,(int,float)) or isinstance(value,bool) or value<=0:
+            raise HTTPException(422,detail={"ok":False,"reason":"limits_invalid","detail":"Only positive bounded runtime limits are accepted."})
+        if key!="timeout_seconds" and int(value)!=value:
+            raise HTTPException(422,detail={"ok":False,"reason":"limits_invalid","detail":"Count limits must be integers."})
+        result[key]=min(result[key],value)
+    return result
+
+def _refresh_stale(row:dict[str,Any],settings:Settings,store:AgentStore,tools:Any=None)->dict[str,Any]:
+    if row["practice_id"] is None or row["stale"]:return row
+    tl=tools
+    if tl is None:
+        try:tl=_service("app.agent_tools")
+        except HTTPException:return row
+    try:
+        bound=row["context"]
+        current=tl.capture_context(settings,row["practice_id"],bound.get("revision"))
+        if current.get("context_fingerprint")!=bound.get("context_fingerprint"):
+            store.mark_stale(row["task_id"])
+            row["stale"]=True
+    except Exception as exc:
+        reason=getattr(exc,"reason",None)
+        if reason in {"context_stale","practice_not_found","revision_conflict","context_invalid"}:
+            store.mark_stale(row["task_id"])
+            row["stale"]=True
+    return row
+
+
+def create_agent_router(settings:Settings,store:AgentStore|None=None,manager:AgentTaskManager|None=None,
+                        gateway:Any=None,tools:Any=None)->APIRouter:
+    router=APIRouter(prefix="/api/agent",tags=["agent"])
+    agent_store=store or AgentStore(settings.runtime_dir/"agent"/"tasks.sqlite3")
+    task_manager=manager or AgentTaskManager(settings,agent_store,gateway,tools)
+
+    @router.get("/config")
+    def get_config():
+        gw=gateway or _service("app.agent_gateway")
+        try:return _public_config(gw,settings)
+        except HTTPException:raise
+        except Exception as exc:raise _failure(exc,"agent_config_unavailable",503) from None
+
+    @router.put("/config")
+    def put_config(body:ConfigBody):
+        gw=gateway or _service("app.agent_gateway")
+        try:return gw.save_config(settings,body.model_dump(exclude_none=True))
+        except Exception as exc:raise _failure(exc,"agent_config_invalid") from None
+
+    @router.post("/config/test")
+    async def test_config(body:TestBody):
+        if body.consent is not True or body.test_tools is not True:
+            raise HTTPException(400,detail={"ok":False,"reason":"consent_required","detail":"Explicit consent to the tool capability test is required."})
+        gw=gateway or _service("app.agent_gateway")
+        try:return await gw.test_config(settings,body.model_dump())
+        except Exception as exc:raise _failure(exc,"agent_test_failed",502) from None
+
+    @router.get("/disclosure")
+    def get_disclosure(practice_id:str|None=None,expected_revision:int|None=None):
+        gw=gateway or _service("app.agent_gateway"); tl=tools or _service("app.agent_tools")
+        return _disclosure(settings,gw,tl,practice_id,expected_revision)[0]
+
+    @router.post("/tasks",status_code=202)
+    async def create_task(body:TaskBody):
+        if body.consent is not True:raise HTTPException(400,detail={"ok":False,"reason":"consent_required","detail":"Explicit consent is required."})
+        try:
+            existing=agent_store.existing(body.idempotency_key,body.model_dump())
+        except IdempotencyConflict:
+            raise HTTPException(409,detail={"ok":False,"reason":"idempotency_conflict","detail":"Idempotency key was already used with a different payload."}) from None
+        if existing is not None:
+            return {k:v for k,v in existing.items() if k not in ("consent_digest","limits","attempt")}
+        gw=gateway or _service("app.agent_gateway"); tl=tools or _service("app.agent_tools")
+        disclosure,context=await asyncio.to_thread(_disclosure,settings,gw,tl,body.practice_id,body.expected_revision)
+        effective_limits=_lower_limits(disclosure["limits"],body.limits)
+        current_config,config=_config_payload(await asyncio.to_thread(_public_config,gw,settings))
+        if body.config_version!=current_config or body.consent_digest!=disclosure["consent_digest"]:
+            raise HTTPException(409,detail={"ok":False,"reason":"consent_stale","detail":"Configuration or simulation context changed; review disclosure again."})
+        if not body.idempotency_key.strip():raise HTTPException(422,detail={"ok":False,"reason":"idempotency_key_invalid","detail":"A non-empty idempotency key is required."})
+        if body.parent_task_id:
+            parent=agent_store.get(body.parent_task_id)
+            if not parent or parent["practice_id"]!=body.practice_id or parent["context"].get("context_fingerprint")!=context.get("context_fingerprint"):
+                raise HTTPException(409,detail={"ok":False,"reason":"parent_context_invalid","detail":"Parent task must exist and have the same bound simulation context."})
+        try:
+            view,created=agent_store.create(key=body.idempotency_key,payload=body.model_dump(),practice_id=body.practice_id,
+                scope=str(context.get("scope")),goal=body.goal,config_version=body.config_version,context=context,
+                consent_digest=body.consent_digest,limits=effective_limits,parent_task_id=body.parent_task_id)
+        except IdempotencyConflict:
+            raise HTTPException(409,detail={"ok":False,"reason":"idempotency_conflict","detail":"Idempotency key was already used with a different payload."}) from None
+        except ValueError as exc:
+            raise HTTPException(413,detail={"ok":False,"reason":str(exc),"detail":"Task request exceeds the allowed size."}) from None
+        if created: await task_manager.launch(view["task_id"],context)
+        return {k:v for k,v in view.items() if k not in ("consent_digest","limits","attempt")}
+
+    @router.get("/tasks")
+    def list_tasks(practice_id:str|None=None,limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0,le=1_000_000)):
+        rows,total=agent_store.list(practice_id,limit,offset)
+        rows=[_refresh_stale(row,settings,agent_store,tools) for row in rows]
+        return {"tasks":[{k:v for k,v in row.items() if k not in ("consent_digest","limits","attempt")} for row in rows],"total":total}
+
+    @router.get("/tasks/{task_id}")
+    def get_task(task_id:str):
+        row=agent_store.get(task_id)
+        if not row:raise HTTPException(404,detail={"ok":False,"reason":"task_not_found","detail":"Task not found."})
+        row=_refresh_stale(row,settings,agent_store,tools)
+        return {k:v for k,v in row.items() if k not in ("consent_digest","limits","attempt")}
+
+    @router.get("/tasks/{task_id}/events")
+    def task_events(task_id:str,after_seq:int=Query(0,ge=0),limit:int=Query(100,ge=1,le=200)):
+        if not agent_store.get(task_id):raise HTTPException(404,detail={"ok":False,"reason":"task_not_found","detail":"Task not found."})
+        events,next_seq=agent_store.events(task_id,after_seq,limit)
+        return {"events":events,"next_seq":next_seq}
+
+    @router.post("/tasks/{task_id}/cancel")
+    async def cancel_task(task_id:str,body:CancelBody):
+        row=await task_manager.cancel(task_id)
+        if not row:raise HTTPException(404,detail={"ok":False,"reason":"task_not_found","detail":"Task not found."})
+        return {k:v for k,v in row.items() if k not in ("consent_digest","limits","attempt")}
+
+    @router.delete("/tasks/{task_id}")
+    def delete_task(task_id:str):
+        try:deleted=agent_store.delete(task_id)
+        except ActiveTaskError:raise HTTPException(409,detail={"ok":False,"reason":"task_active","detail":"Cancel or wait for the task to finish before deleting it."}) from None
+        if not deleted:raise HTTPException(404,detail={"ok":False,"reason":"task_not_found","detail":"Task not found."})
+        return {"ok":True}
+
+    router.state_manager=task_manager
+    router.state_store=agent_store
+    return router

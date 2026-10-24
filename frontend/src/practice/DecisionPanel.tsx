@@ -113,7 +113,7 @@ export function DecisionPanel({
       )}
 
       {finished ? (
-        <Notice tone="neutral">练习已结束，决策记录保持只读。</Notice>
+        <Notice tone="neutral">模拟已结束，决策记录保持只读。</Notice>
       ) : (
         <form className="practice-form" onSubmit={(event) => void handleSubmit(event)}>
           <label className="practice-field">

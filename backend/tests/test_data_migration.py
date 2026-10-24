@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -51,12 +53,38 @@ def test_initialize_is_idempotent_and_preserves_metadata(temp_settings: Settings
     assert first == second
 
 
+def test_concurrent_first_initialization_creates_one_complete_schema(temp_settings: Settings) -> None:
+    workers = 12
+    start = Barrier(workers)
+
+    def initialize_together():
+        start.wait(timeout=5)
+        return initialize_database(temp_settings)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(lambda _index: initialize_together(), range(workers)))
+
+    assert all(item == results[0] for item in results)
+    with sqlite3.connect(temp_settings.db_path) as conn:
+        table_rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_history'"
+        ).fetchall()
+        metadata = dict(conn.execute("SELECT key,value FROM app_metadata").fetchall())
+        history_count = conn.execute("SELECT COUNT(*) FROM schema_history").fetchone()[0]
+    assert len(table_rows) == 1
+    assert metadata["schema_version"] == str(SCHEMA_VERSION)
+    assert metadata["instance_id"] == results[0].instance_id
+    assert history_count == 0
+
+
 def test_schema1_database_is_not_auto_upgraded(temp_settings: Settings) -> None:
     _write_schema1_db(temp_settings.db_path)
+    before = temp_settings.db_path.read_bytes()
 
     metadata = initialize_database(temp_settings)
 
     assert metadata.schema_version == 1
+    assert temp_settings.db_path.read_bytes() == before
     status = check_database(temp_settings)
     assert status.ready is False
     assert status.reason == "migration_required"

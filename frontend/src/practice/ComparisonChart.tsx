@@ -152,7 +152,7 @@ export function ComparisonChart({
         className="practice-chart-svg"
         viewBox={`0 0 ${width} ${height}`}
         role="img"
-        aria-label="练习对照收益曲线，仅包含已揭晓日期"
+        aria-label="历史模拟对照收益曲线，仅包含已揭晓日期"
       >
         {tickValues.map((value) => {
           const y = yFor(value);

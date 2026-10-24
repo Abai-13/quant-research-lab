@@ -33,6 +33,7 @@ import { formatDate, isFinished } from "./format";
 import { HomeView } from "./HomeView";
 import { SessionView } from "./SessionView";
 import { Notice, type Tone } from "./ui";
+import { AgentPanel } from "./AgentPanel";
 
 const LAST_SESSION_KEY = "practice-last-session";
 
@@ -260,7 +261,7 @@ export function PracticeWorkspace() {
       setReport(null);
       setDecisions([]);
       setMarket(null);
-      setNotice({ tone: "ok", text: "练习已创建。请查看已揭晓行情，自主下单后揭晓下一交易日。" });
+      setNotice({ tone: "ok", text: "模拟已创建。请查看已揭晓行情，自主下单后揭晓下一交易日。" });
       void loadSessions();
     } catch (error) {
       setNotice({ tone: "error", text: errorText(error) });
@@ -329,7 +330,7 @@ export function PracticeWorkspace() {
     planned_shares: number;
   }): Promise<OrderPreview> {
     if (!session) {
-      throw new Error("练习尚未加载完成。");
+      throw new Error("模拟尚未加载完成。");
     }
     return previewOrder(session.practice_id, input);
   }
@@ -341,7 +342,7 @@ export function PracticeWorkspace() {
     key: string;
   }) {
     if (!session) {
-      throw new Error("练习尚未加载完成。");
+      throw new Error("模拟尚未加载完成。");
     }
     setBusy("order");
     setNotice(null);
@@ -427,7 +428,7 @@ export function PracticeWorkspace() {
       } else {
         void loadReport(result.session.practice_id);
       }
-      setNotice({ tone: "ok", text: "练习已结束，复盘报告已生成；旧记录保持可读。" });
+      setNotice({ tone: "ok", text: "模拟已结束，复盘报告已生成；旧记录保持可读。" });
       void loadSessions();
     } catch (error) {
       if (isRevisionConflict(error)) {
@@ -457,7 +458,7 @@ export function PracticeWorkspace() {
       setReportError(null);
       setDecisions([]);
       setMarket(null);
-      setNotice({ tone: "ok", text: "已创建全新的练习身份，旧练习与报告仍然保留。" });
+      setNotice({ tone: "ok", text: "已创建全新的模拟身份，旧模拟与报告仍然保留。" });
       void loadSessions();
       void loadDecisions(created.practice_id);
       const code =
@@ -480,7 +481,7 @@ export function PracticeWorkspace() {
     key: string;
   }) {
     if (!session) {
-      throw new Error("练习尚未加载完成。");
+      throw new Error("模拟尚未加载完成。");
     }
     setBusy("decision");
     try {
@@ -516,8 +517,8 @@ export function PracticeWorkspace() {
     return (
       <div className="practice-home">
         <div className="empty-state">
-          <p className="empty-title">正在从服务端恢复练习…</p>
-          <p>刷新页面时会按地址中的练习标识重新读取进度，不依赖浏览器内存。</p>
+          <p className="empty-title">正在从服务端恢复模拟…</p>
+          <p>刷新页面时会按地址中的模拟标识重新读取进度，不依赖浏览器内存。</p>
         </div>
       </div>
     );
@@ -526,7 +527,7 @@ export function PracticeWorkspace() {
   if (sessionId && sessionError && !session) {
     return (
       <div className="practice-home">
-        <Notice tone="error" title="无法打开练习">
+        <Notice tone="error" title="无法打开模拟">
           {sessionError}
         </Notice>
         <div className="practice-form-actions">
@@ -534,7 +535,7 @@ export function PracticeWorkspace() {
             重试
           </button>
           <button type="button" className="link-button" onClick={backToHome}>
-            返回练习首页
+            返回模拟首页
           </button>
         </div>
       </div>
@@ -544,6 +545,10 @@ export function PracticeWorkspace() {
   if (session) {
     return (
       <div className="practice-home">
+        <AgentPanel
+          session={session}
+          onPracticeRefresh={() => void loadSession(session.practice_id, true, true)}
+        />
         <SessionView
           key={session.practice_id}
           session={session}

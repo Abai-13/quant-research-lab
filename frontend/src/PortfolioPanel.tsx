@@ -443,7 +443,7 @@ export function PortfolioPanel() {
               <p className="muted">模拟现金 {formatCents(simState.cash_cents)} 元；持仓{simState.positions.map((p) => ` · ${p.ts_code} ${p.shares}股（可卖 ${p.sellable_shares ?? "未知"}）`).join("") || " 无"}</p>
               <ul>{simState.orders.map((order) => <li key={order.order_id}>{order.trade_date} · {order.direction === "buy" ? "买入" : "卖出"} {order.ts_code} {order.filled_shares}/{order.planned_shares} 股 · {order.status}{order.reason_code ? ` · 受限原因 ${order.reason_code}` : ""}</li>)}</ul>
             </> : null}
-            <p className="muted">提交订单不会推进日期；网络结果不明时重试当前草稿会复用幂等键。日期由用户指定，本页面不编排完整逐日练习。</p>
+            <p className="muted">提交订单不会推进日期；网络结果不明时重试当前草稿会复用幂等键。日期由用户指定，本页面不编排完整逐日历史模拟。</p>
           </div>
         </article>
       </div>

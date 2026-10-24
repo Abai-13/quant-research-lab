@@ -131,6 +131,7 @@ export function NewPracticeForm({
   creating,
   onCreate,
   onPrepareDemo,
+  setupDraft,
 }: {
   options: PracticeOptions | null;
   demo: DemoPreparation | null;
@@ -138,8 +139,9 @@ export function NewPracticeForm({
   creating: boolean;
   onCreate: (input: CreatePracticeInput) => Promise<void>;
   onPrepareDemo: () => Promise<void>;
+  setupDraft?: Record<string, unknown> | null;
 }) {
-  const [name, setName] = useState("我的历史练习");
+  const [name, setName] = useState("我的历史模拟");
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [cash, setCash] = useState("100000.00");
@@ -196,9 +198,36 @@ export function NewPracticeForm({
       setSourceCode(demo.sourceCode);
     }
     if (demo.options) {
-      setName((current) => (current === "我的历史练习" ? "合成示例练习" : current));
+      setName((current) => (current === "我的历史模拟" ? "合成示例模拟" : current));
     }
   }, [demo]);
+
+  useEffect(() => {
+    if (!setupDraft) return;
+    const date = (value: unknown) => typeof value === "string" ? toInputDate(value) : "";
+    if (typeof setupDraft.name === "string") setName(setupDraft.name);
+    if (setupDraft.start_date) setStartDate(date(setupDraft.start_date));
+    if (setupDraft.end_date) setEndDate(date(setupDraft.end_date));
+    const cashCents = setupDraft.cash_cents ?? setupDraft.initial_cash_cents;
+    if (typeof cashCents === "number" && Number.isFinite(cashCents)) setCash((cashCents / 100).toFixed(2));
+    if (typeof setupDraft.data_version_id === "string") setVersionId(setupDraft.data_version_id);
+    if (typeof setupDraft.source_code === "string") setSourceCode(setupDraft.source_code);
+    if (Array.isArray(setupDraft.positions)) {
+      const prepared = setupDraft.positions.flatMap((raw): PositionDraft[] => {
+        if (!raw || typeof raw !== "object") return [];
+        const position = raw as Record<string, unknown>;
+        if (typeof position.ts_code !== "string") return [];
+        return [{
+          id: crypto.randomUUID(), code: position.ts_code, query: position.ts_code,
+          shares: String(position.shares ?? ""),
+          cost: typeof position.total_cost_cents === "number" ? (position.total_cost_cents / 100).toFixed(2) : "",
+          sellable: position.sellable_shares === undefined || position.sellable_shares === null ? "" : String(position.sellable_shares),
+        }];
+      });
+      setPositions(prepared);
+    }
+    setFormError(null);
+  }, [setupDraft]);
 
   const selectedVersion = options?.versions.find((version) => version.version_id === versionId) ?? null;
 
@@ -305,7 +334,7 @@ export function NewPracticeForm({
     }
 
     if (name.trim() === "") {
-      setFormError("请填写练习名称。");
+      setFormError("请填写模拟名称。");
       return;
     }
 
@@ -330,7 +359,7 @@ export function NewPracticeForm({
       await onCreate(payload);
       keyRef.current = null;
     } catch {
-      // 失败时保留幂等键，用户重试同一份内容不会创建重复练习。
+      // 失败时保留幂等键，用户重试同一份内容不会创建重复会话。
     }
   }
 
@@ -341,7 +370,7 @@ export function NewPracticeForm({
       <div className="practice-card practice-form-card">
         <div className="practice-card-header">
           <div>
-            <h2 id="new-practice-heading">新建历史练习</h2>
+            <h2 id="new-practice-heading">创建历史模拟</h2>
             <p className="muted">
               设定一段已经发生的历史区间，从当时可用的信息开始；每天由你手动揭晓下一交易日。
             </p>
@@ -359,11 +388,11 @@ export function NewPracticeForm({
 
         {!options ? (
           <Notice tone="neutral">
-            正在读取可用的数据来源与版本；若后端练习接口尚未就绪，这里会给出明确提示，而不会显示假选项。
+              正在读取可用的数据来源与版本；若历史模拟服务尚未就绪，这里会给出明确提示，而不会显示假选项。
           </Notice>
         ) : options.versions.length === 0 ? (
           <Notice tone="warn" title="暂无可选数据版本">
-            请先在“运行与诊断”中检查数据状态，或点击“准备合成示例”生成离线示例；没有数据版本时不能创建练习。
+            请先在“运行与诊断”中检查数据状态，或点击“准备合成示例”生成离线示例；没有数据版本时不能创建模拟。
           </Notice>
         ) : null}
 
@@ -371,7 +400,7 @@ export function NewPracticeForm({
           <Notice tone="warn" title="合成示例数据已准备">
             <p>
               示例区间 {formatDate(demo.startDate)} ~ {formatDate(demo.endDate)}，仅用于离线体验，
-              数据会明确标注为合成。它不会自动创建练习，点击下方“创建练习”后才开始。
+              数据会明确标注为合成。它不会自动创建模拟，点击下方“创建模拟”后才开始。
             </p>
             {demo.limitations.length > 0 ? (
               <ul className="practice-restrictions">
@@ -397,7 +426,7 @@ export function NewPracticeForm({
         <form className="practice-form" onSubmit={(event) => void handleSubmit(event)}>
           <div className="practice-form-grid">
             <label className="practice-field">
-              <span>练习名称</span>
+              <span>模拟名称</span>
               <input
                 value={name}
                 disabled={!ready}
@@ -456,7 +485,7 @@ export function NewPracticeForm({
                 disabled={!ready}
                 onChange={(event) => setHideSystemHints(event.target.checked)}
               />
-              <span>默认隐藏系统建议（可随时在练习中显示）</span>
+              <span>默认隐藏系统建议（可随时在模拟中显示）</span>
             </label>
           </div>
 
@@ -530,14 +559,14 @@ export function NewPracticeForm({
           </div>
 
           <p className="practice-field-hint">
-            系统路径默认每 5 个已揭晓交易日检查一次，并受个股权重上限与现金保留约束；这些默认值来自服务端规则组合，不会在练习中途静默修改。
+            系统路径默认每 5 个已揭晓交易日检查一次，并受个股权重上限与现金保留约束；这些默认值来自服务端规则组合，不会在模拟中途静默修改。
           </p>
 
           {formError ? <Notice tone="error">{formError}</Notice> : null}
 
           <div className="practice-form-actions">
             <button type="submit" className="practice-primary" disabled={!ready || !versionId}>
-              {creating ? "创建中…" : "创建练习"}
+              {creating ? "创建中…" : "创建模拟"}
             </button>
             <span className="muted">创建后可在首页继续或重开；刷新页面会从服务端恢复进度。</span>
           </div>

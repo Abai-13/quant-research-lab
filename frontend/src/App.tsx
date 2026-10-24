@@ -48,7 +48,7 @@ export default function App() {
               aria-current={view === "practice" ? "page" : undefined}
               onClick={() => switchView("practice")}
             >
-              历史练习
+              历史模拟
             </button>
             <button
               type="button"
@@ -73,9 +73,9 @@ export default function App() {
       </main>
 
       <footer className="app-footer">
-        <span>阶段 4 · 历史练习闭环</span>
-        <span>本地模拟 · 不使用真实资金</span>
-        <span>Agent 对话将在阶段 5 接入</span>
+        <span>历史模拟 · Agent 任务工作台</span>
+        <span>仅作历史规则下的模拟，不接入真实资金</span>
+        <span>工具步骤与依据可逐项核对</span>
       </footer>
     </div>
   );

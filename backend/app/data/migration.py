@@ -192,10 +192,31 @@ def initialize_database(settings: SettingsLike) -> Metadata:
                 "schema_incompatible",
                 "数据库包含非本应用的表，拒绝自动改写: " + ", ".join(sorted(tables)[:5]),
             )
+        # Serialize first-time schema creation across threads and processes.
+        # Recheck while holding SQLite's write lock; existing/legacy databases
+        # return above without taking this lock or being migrated.
+        conn.execute("BEGIN IMMEDIATE")
+        _check_integrity(conn)
+        tables = table_names(conn)
+        if METADATA_TABLE in tables:
+            metadata = _read_metadata(conn)
+            if metadata.schema_version in (*_MIGRATABLE_VERSIONS, SCHEMA_VERSION):
+                return metadata
+            raise DatabaseError(
+                "schema_incompatible",
+                f"数据库 schema 版本为 {metadata.schema_version}，"
+                f"本应用支持 {', '.join(str(v) for v in _MIGRATABLE_VERSIONS)}（待迁移）或 {SCHEMA_VERSION}",
+            )
+        if tables:
+            raise DatabaseError(
+                "schema_incompatible",
+                "数据库包含非本应用的表，拒绝自动改写: " + ", ".join(sorted(tables)[:5]),
+            )
         try:
-            with conn:
-                metadata = _create_fresh_schema(conn)
+            metadata = _create_fresh_schema(conn)
+            conn.commit()
         except sqlite3.Error as exc:
+            conn.rollback()
             raise DatabaseError("database_unavailable", f"创建数据库结构失败: {exc}") from exc
         return metadata
     except sqlite3.DatabaseError as exc:

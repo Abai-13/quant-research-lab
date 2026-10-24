@@ -200,7 +200,7 @@ export function TradePanel({
       </div>
 
       {finished ? (
-        <Notice tone="neutral">练习已结束，不再接受新订单。</Notice>
+        <Notice tone="neutral">模拟已结束，不再接受新订单。</Notice>
       ) : null}
 
       <div className="practice-trade-grid">

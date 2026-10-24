@@ -36,7 +36,7 @@ export function ReportView({
     );
   }
   if (!report) {
-    return <EmptyState title="还没有复盘内容">结束练习后会在这里生成报告。</EmptyState>;
+    return <EmptyState title="还没有复盘内容">结束模拟后会在这里生成报告。</EmptyState>;
   }
 
   return (
@@ -92,7 +92,7 @@ export function ReportView({
           <h3>决策记录</h3>
         </div>
         {report.decisions.length === 0 ? (
-          <p className="muted">本次练习没有决策记录。</p>
+          <p className="muted">本次模拟没有决策记录。</p>
         ) : (
           <ol className="practice-decision-list">
             {report.decisions.map((decision) => (
