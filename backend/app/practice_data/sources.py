@@ -24,6 +24,7 @@ BAOSTOCK_DEF: dict[str, Any] = {
     "name": "BaoStock 免费历史行情",
     "needs_credentials": False,
     "permission_status": "documented",
+    "client_license": "BaoStock Python client 0.9.4 is distributed on PyPI under BSD License; this describes client code, not market data.",
     "license": (
         "客户端 Python 库免费、开源；数据平台自述为“免费、开源的证券数据平台"
         "（无需注册）”（官网 baostock.com）。官网免责声明未提供行情数据的再分发"
@@ -46,16 +47,23 @@ BAOSTOCK_DEF: dict[str, Any] = {
     "limitations": [
         "客户端开源许可不等于行情数据许可；再分发/商用无书面授权，仅限本项目本地与练习用途。",
         "官网确认存在 IP 级访问限制机制；具体限频阈值未公开，实现上保守（显式触发、小批量、串行）。",
-        "复权采用涨跌幅复权算法，未提供 Tushare 式独立 adj_factor 序列；本版只取不复权日线。",
+        "上游另有 query_adjust_factor 接口；本版未接入/校验，只取不复权日线，因此不能据此声称上游无复权因子能力。",
         "分红税后额与送转说明为模糊文本列，不做数值化换算。",
-        "账号实际访问资格、历史覆盖完整性与真实限频未核验，保持“文档宣称”状态。",
+        "已验证匿名免费访问的小样本；账号后续资格、历史覆盖完整性与真实限频未核验，访问资格仍为“文档宣称”。",
+        "SDK 0.9.4 没有公开 per-request timeout；准备任务在隔离子进程执行并在预算到期时终止，以实现有界回收。",
     ],
     "evidence": {
-        "verified_sample": (
-            "2026-10-24 以官方 Python 客户端 0.9.4 取真实小样本（sh.600000 日线 "
-            "2024-07-01..07-05 五行 + stock_basic + trade_dates + 2017 年分红），"
-            "字段契约与官方文档一致；仅作开发核验，不提交样本数据。"
+        "review_scope": (
+            "The dated anonymous sample below is historical implementation evidence; this independent review did not repeat a BaoStock request. "
+            "It does not establish account eligibility, full-range coverage, rate limits, or market-data redistribution rights."
         ),
+        "verified_sample": (
+            "2026-10-25 在隔离 TEMP venv 安装 PyPI baostock 0.9.4，以官方客户端取真实 "
+            "sh.600000 不复权日线 2024-07-01..07-05 共 5 行、query_trade_dates 共 5 行；"
+            "字段与 API 契约一致。仅为有限开发样本，不代表完整覆盖或可商用/再分发授权。"
+        ),
+        "docs": "https://www.baostock.com/baostock/index.php/Python_API%E6%96%87%E6%A1%A3",
+        "package": "https://pypi.org/project/baostock/0.9.4/",
     },
 }
 
@@ -79,7 +87,7 @@ SYNTHETIC_DEF: dict[str, Any] = {
 SOURCE_LIMITATIONS: list[str] = [
     "本阶段只提供日线行情版本；交易日历校验、复权因子序列与分红写入未启用，"
     "公司行为对账保持受限。",
-    "除显式 /data/refresh 外没有任何联网路径；GET 接口与启动流程不取数。",
+    "仅显式 /data/refresh、/data/prepare，或用户启用已保存范围的启动策略会联网；GET 与默认启动不取数。",
 ]
 
 AVAILABLE_SOURCES = ("baostock", "synthetic")

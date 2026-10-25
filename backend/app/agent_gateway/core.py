@@ -16,6 +16,9 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     from app.config import Settings
 
+from ..credentials import CredentialManager, CredentialError
+from ..credentials.service import target_fingerprint
+
 from .security import (
     SecretProtectionError,
     SecretProtector,
@@ -107,7 +110,7 @@ class GatewayService:
         self._transport = transport or guarded_post
         self._directory = Path(settings.runtime_dir) / "agent" / "gateway"
         self._config_path = self._directory / "config.json"
-        self._secrets_path = self._directory / "secrets.dpapi"
+        self._legacy_secrets_path = self._directory / "secrets.dpapi"
 
     def _get_protector(self) -> SecretProtector:
         if self._protector is not None:
@@ -125,19 +128,36 @@ class GatewayService:
             return {"active_version": None, "versions": []}, {}
         try:
             protect_storage_path(self._directory)
-            protect_storage_path(self._secrets_path)
             state = json.loads(self._config_path.read_text(encoding="utf-8"))
             if not isinstance(state, dict) or not isinstance(state.get("versions"), list):
                 raise ValueError
-            if not self._secrets_path.exists():
-                raise SecretProtectionError("Protected API key is missing; reconfigure it")
-            sealed = base64.b64decode(self._secrets_path.read_bytes(), validate=True)
-            plain = self._get_protector().unprotect(sealed)
-            secrets_by_version = json.loads(plain.decode("utf-8"))
-            if not isinstance(secrets_by_version, dict) or not all(
-                isinstance(k, str) and isinstance(v, str) for k, v in secrets_by_version.items()
-            ):
-                raise ValueError
+            secrets_by_version: dict[str, str] = {}
+            active = next((item for item in state["versions"] if item.get("config_version") == state.get("active_version")), None)
+            manager = self._credential_manager()
+            if active and active.get("credential_generation") is not None:
+                try:
+                    key = manager.resolve("model", active["credential_target_fingerprint"],
+                        expected_generation=active["credential_generation"])
+                    secrets_by_version[active["config_version"]] = key
+                except CredentialError as exc:
+                    if exc.reason not in {"credential_missing", "credential_cleared", "process_credential_missing"}:
+                        raise
+            elif active and manager.has_managed_state("model"):
+                # A newly managed value supersedes a legacy config even if a crash interrupted
+                # binding its generation into config.json. Never fall back to the older DPAPI blob.
+                target = self._credential_target(active)
+                entry = manager.status("model", target_fingerprint=target)
+                if entry["configured"]:
+                    key = manager.resolve("model", target, expected_generation=entry["credential_generation"])
+                    secrets_by_version[active["config_version"]] = key
+            elif active and self._legacy_secrets_path.exists():
+                # Phase 5 secrets.dpapi is read-only compatibility input.
+                sealed = base64.b64decode(self._legacy_secrets_path.read_bytes(), validate=True)
+                plain = self._get_protector().unprotect(sealed)
+                legacy = json.loads(plain.decode("utf-8"))
+                if not isinstance(legacy, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in legacy.items()):
+                    raise ValueError
+                secrets_by_version = legacy
             return state, secrets_by_version
         except GatewayError:
             raise
@@ -145,6 +165,40 @@ class GatewayService:
             raise GatewayError("secret_store_unavailable", str(exc), 503) from exc
         except Exception as exc:
             raise GatewayError("secret_store_unavailable", "Stored configuration cannot be decrypted; reconfigure the API key", 503) from exc
+
+    def _credential_manager(self) -> CredentialManager:
+        return CredentialManager(self.settings.runtime_dir, protector=self._protector)
+
+    @property
+    def _secrets_path(self) -> Path:
+        manager = self._credential_manager()
+        generation = manager.status("model")["credential_generation"]
+        return manager._secret_path("model", generation or 1)
+
+    def clear_configuration_metadata(self) -> None:
+        """Remove model endpoint/version history while retaining no legacy secret writes."""
+        if not self._config_path.exists():
+            return
+        try:
+            state = json.loads(self._config_path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict) or not isinstance(state.get("versions"), list):
+                raise ValueError
+            state["versions"] = []
+            state["active_version"] = None
+            _atomic_private_write(self._config_path, json.dumps(state, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+            # Explicit credential clear also discards the read-only phase 5 ciphertext.
+            try:
+                self._legacy_secrets_path.unlink()
+            except FileNotFoundError:
+                pass
+        except Exception as exc:
+            raise GatewayError("configuration_unavailable", "Model configuration could not be cleared", 503) from exc
+
+    @staticmethod
+    def _credential_target(record: dict[str, Any]) -> str:
+        encoded = json.dumps({key: record[key] for key in ("base_url", "protocol", "allow_loopback_http", "trusted_private_https")},
+                             separators=(",", ":"), sort_keys=True)
+        return target_fingerprint(encoded)
 
     def get_public_config(self) -> dict[str, Any]:
         state, secret_map = self._load_state()
@@ -166,6 +220,51 @@ class GatewayService:
         with _CONFIG_LOCK:
             return self._save_config(body)
 
+    def replace_active_credential(self, *, secret: str, storage_mode: str, target: str,
+                                  expected_generation: int, idempotency_key: str) -> dict[str, Any]:
+        """Replace the active model Key while keeping its validated endpoint binding."""
+        if not isinstance(secret, str) or len(secret.strip()) < 8 or len(secret) > 4096 or "\r" in secret or "\n" in secret:
+            raise GatewayError("invalid_config", "API key must contain at least 8 characters")
+        if storage_mode not in {"persistent", "process"}:
+            raise GatewayError("invalid_config", "Storage mode must be persistent or process")
+        if not isinstance(target, str) or not re.fullmatch(r"[a-f0-9]{64}", target):
+            raise GatewayError("invalid_config", "Credential target fingerprint is invalid")
+        with _CONFIG_LOCK:
+            state, _ = self._load_state(required=True)
+            active_version = state.get("active_version")
+            record = next((item for item in state["versions"] if item.get("config_version") == active_version), None)
+            if record is None:
+                raise GatewayError("configuration_missing", "Configure a model endpoint before saving its credential", 409)
+            current_target = self._credential_target(record)
+            if target != current_target:
+                raise GatewayError("target_mismatch", "Reload the active model endpoint before saving its credential", 409)
+            manager = self._credential_manager()
+            try:
+                public = manager.save(slot="model", provider="model", target_fingerprint=current_target,
+                    secret=secret, storage_mode=storage_mode, expected_generation=expected_generation,
+                    idempotency_key=idempotency_key)
+            except CredentialError as exc:
+                raise GatewayError(exc.reason, exc.detail, exc.status_code) from exc
+            latest = manager.status("model", target_fingerprint=current_target)
+            if public["target_fingerprint"] != current_target:
+                raise GatewayError("idempotency_conflict", "Idempotent credential request belongs to a different model target", 409)
+            if public["credential_generation"] < latest["credential_generation"]:
+                # A replay of an older successful request must never roll config.json back.
+                return public
+            record["credential_target_fingerprint"] = current_target
+            record["credential_generation"] = public["credential_generation"]
+            try:
+                _atomic_private_write(self._config_path,
+                    json.dumps(state, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+                # Explicit replacement discards the old read-only compatibility ciphertext.
+                try:
+                    self._legacy_secrets_path.unlink()
+                except FileNotFoundError:
+                    pass
+            except Exception as exc:
+                raise GatewayError("secret_store_unavailable", "Model credential binding could not be stored", 503) from exc
+            return public
+
     def _save_config(self, body: object) -> dict[str, Any]:
         if not isinstance(body, dict):
             raise GatewayError("invalid_config", "Configuration body must be an object")
@@ -179,6 +278,9 @@ class GatewayService:
         endpoint = _safe_endpoint_config(body)
         limits = _validate_limits(body.get("limits"))
         api_key = body.get("api_key")
+        storage_mode = body.get("storage_mode", "persistent")
+        if storage_mode not in {"persistent", "process"}:
+            raise GatewayError("invalid_config", "Storage mode must be persistent or process")
         if api_key is not None and (not isinstance(api_key, str) or len(api_key.strip()) < 8 or len(api_key) > 4096
                                     or "\r" in api_key or "\n" in api_key):
             raise GatewayError("invalid_config", "API key must contain at least 8 characters")
@@ -209,9 +311,11 @@ class GatewayService:
             raise GatewayError("key_required", "Provide the API key again when the protocol or target changes")
         if current_version is None and not api_key:
             raise GatewayError("key_required", "Provide an API key to configure the model")
-        if api_key is None and current_version and current_version not in secrets_by_version:
+        key_value = api_key if api_key is not None else secrets_by_version.get(current_version)
+        if not key_value:
             raise GatewayError("key_required", "Stored API key is unavailable; reconfigure it")
-        key_value = api_key if api_key is not None else secrets_by_version[current_version]
+        if current is not None and current.get("credential_generation") is None and api_key is None:
+            raise GatewayError("key_required", "Re-enter the API key to move this legacy configuration into managed storage")
         version = secrets.token_hex(16)
         record = {
             "config_version": version,
@@ -223,13 +327,24 @@ class GatewayService:
         }
         if key_value in json.dumps(record, separators=(",", ":"), ensure_ascii=False):
             raise GatewayError("invalid_config", "API key cannot be included in public configuration fields")
+        target = self._credential_target(record)
+        manager = self._credential_manager()
+        before = manager.status("model", target_fingerprint=target)
+        generation = int(before["credential_generation"])
+        if api_key is not None:
+            try:
+                managed = manager.save(slot="model", provider="model", target_fingerprint=target, secret=api_key,
+                    storage_mode=storage_mode, expected_generation=generation, idempotency_key=f"gateway-config-{version}")
+            except CredentialError as exc:
+                raise GatewayError(exc.reason, exc.detail, exc.status_code) from exc
+            generation = managed["credential_generation"]
+        elif current and current.get("credential_target_fingerprint") != target:
+            raise GatewayError("key_required", "Provide the API key again when the protocol or target changes")
+        record["credential_target_fingerprint"] = target
+        record["credential_generation"] = generation
         state["versions"].append(record)
         state["active_version"] = version
-        secrets_by_version[version] = key_value
         try:
-            protector = self._get_protector()
-            protected = protector.protect(json.dumps(secrets_by_version, separators=(",", ":")).encode("utf-8"))
-            _atomic_private_write(self._secrets_path, base64.b64encode(protected))
             _atomic_private_write(self._config_path, json.dumps(state, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
         except GatewayError:
             raise
@@ -247,6 +362,12 @@ class GatewayService:
         state, secrets_by_version = self._load_state(required=True)
         record = next((item for item in state["versions"] if item.get("config_version") == config_version), None)
         api_key = secrets_by_version.get(config_version)
+        if record is not None and record.get("credential_generation") is not None:
+            try:
+                api_key = self._credential_manager().resolve("model", record["credential_target_fingerprint"],
+                    expected_generation=record["credential_generation"])
+            except CredentialError as exc:
+                raise GatewayError(exc.reason, exc.detail, exc.status_code) from exc
         if record is None or not isinstance(api_key, str) or not api_key:
             raise GatewayError("configuration_missing", "Configuration version or API key is unavailable", 404)
         if not isinstance(messages, list) or not messages or len(messages) > 100:

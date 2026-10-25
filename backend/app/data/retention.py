@@ -1431,6 +1431,10 @@ def apply_cleanup(
                 try:
                     mark_preview_pending_rolled_back(side, preview_id)
                     set_recovery_point_state(side, preview_id, "aborted")
+                    # A failed mid-batch application cannot reuse the preview:
+                    # its verified plan may now describe a partially changed
+                    # world even though the SQLite transaction was rolled back.
+                    update_preview_state(side, preview_id, "failed")
                 except Exception:
                     pass
                 for summary_id in quality_summaries:

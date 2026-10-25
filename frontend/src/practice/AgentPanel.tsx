@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { AgentConfigResponse, AgentDisclosure, AgentDraft, AgentEvent, AgentLimits, AgentTask } from "./agentTypes";
-import { cancelAgentTask, createAgentTask, deleteAgentTask, getAgentConfig, getAgentEvents, getAgentTask, getAgentTasks, getDisclosure, saveAgentConfig, testAgentConfig } from "./agentClient";
+import { cancelAgentTask, createAgentTask, deleteAgentTask, getAgentConfig, getAgentEvents, getAgentTask, getAgentTasks, getDisclosure, resumeAgentTask, saveAgentConfig, testAgentConfig } from "./agentClient";
 import type { PracticeView, OrderPreview } from "./types";
 import { fetchSession, placeOrder, previewOrder } from "./client";
 import { formatBps, formatCents, formatDateShort, formatShares, isRunning } from "./format";
@@ -47,6 +47,8 @@ export function AgentPanel({ session = null, onPracticeRefresh, onSetupDraft }: 
   const [goal, setGoal] = useState("");
   const [requestLimits, setRequestLimits] = useState<AgentLimits>(DEFAULT_LIMITS);
   const [disclosure, setDisclosure] = useState<AgentDisclosure | null>(null);
+  const [resumeDisclosure, setResumeDisclosure] = useState<AgentDisclosure | null>(null);
+  const [resumeConsented, setResumeConsented] = useState(false);
   const [consented, setConsented] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [panelError, setPanelError] = useState<string | null>(null);
@@ -118,6 +120,21 @@ export function AgentPanel({ session = null, onPracticeRefresh, onSetupDraft }: 
     try { const next = await getDisclosure(practiceId, session?.revision ?? null); setDisclosure(next); setRequestLimits({ ...next.limits }); }
     catch (error) { setPanelError(error instanceof Error ? error.message : "数据披露摘要获取失败。"); }
     finally { setBusy(null); }
+  }
+  async function loadResumeDisclosure(task: AgentTask) {
+    if (!task.resumable || !task.practice_id) return;
+    setBusy("resume-disclosure"); setPanelError(null); setResumeDisclosure(null); setResumeConsented(false);
+    const taskRevision = typeof task.context.revision === "number" ? task.context.revision : null;
+    try { const next = await getDisclosure(task.practice_id, taskRevision); setResumeDisclosure(next); }
+    catch (error) { setPanelError(error instanceof Error ? error.message : "恢复披露摘要获取失败。"); }
+    finally { setBusy(null); }
+  }
+  async function submitResume(task: AgentTask) {
+    if (!task.resumable || !task.operation_id || task.generation === undefined || !resumeDisclosure || !resumeConsented || inFlight.current) return;
+    inFlight.current = true; setBusy("resume"); setPanelError(null);
+    try { const resumed = await resumeAgentTask(task.operation_id, { consent: true, expected_generation: task.generation, config_version: resumeDisclosure.config_version, consent_digest: resumeDisclosure.consent_digest, idempotency_key: newKey() }); setSelected(resumed); setResumeDisclosure(null); setResumeConsented(false); setEvents([]); setNextSeq(0); await refreshTasks(); }
+    catch (error) { setPanelError(error instanceof Error ? error.message : "恢复任务失败；请重新读取状态与披露摘要。"); }
+    finally { inFlight.current = false; setBusy(null); }
   }
   async function submitGoal(event: React.FormEvent) {
     event.preventDefault();
@@ -206,6 +223,8 @@ export function AgentPanel({ session = null, onPracticeRefresh, onSetupDraft }: 
       {selected.stale ? <Notice tone="warn">绑定模拟版本已过期；此结果仅供历史查看，草稿不能提交。</Notice> : null}
       <div className="agent-usage"><span>输入 Token：{fmt(selected.usage.input_tokens)}</span><span>输出 Token：{fmt(selected.usage.output_tokens)}</span><span>合计：{fmt(selected.usage.total_tokens)}</span><span>模型调用：{selected.usage.model_calls}</span><span>工具调用：{selected.usage.tool_calls}</span><span>用时：{fmt(selected.usage.elapsed_ms, " ms")}</span><span>费用估算：{selected.usage.estimated_cost === null ? "未知" : String(selected.usage.estimated_cost)}</span></div>
       {selected.stop_reason ? <p className="agent-stop-reason">停止原因：{selected.stop_reason}</p> : null}
+      {selected.status === "interrupted" && selected.resumable ? <div className="agent-disclosure"><h4>任务可恢复</h4><p>恢复状态由服务端校验。继续前需重新读取并确认本次外发内容，旧授权不会沿用。</p>{!resumeDisclosure ? <button type="button" className="refresh-button" onClick={() => void loadResumeDisclosure(selected)} disabled={Boolean(busy)}>重新生成恢复披露摘要</button> : <><dl><div><dt>提供方 / 目标</dt><dd>{resumeDisclosure.target.name} · {resumeDisclosure.target.base_url} · {resumeDisclosure.target.model}</dd></div><div><dt>用途</dt><dd>{resumeDisclosure.purpose}</dd></div><div><dt>可能收费</dt><dd>{resumeDisclosure.possible_cost ? "是，取决于服务商" : "服务端标记为否"}</dd></div><div><dt>剩余预算 / 限制</dt><dd>{resumeDisclosure.limits.rounds} 轮 · {resumeDisclosure.limits.tool_calls} 次工具 · {resumeDisclosure.limits.timeout_seconds} 秒 · {resumeDisclosure.limits.tokens} Token</dd></div></dl><strong>本次数据类别</strong><ul>{resumeDisclosure.data_categories.map(item => <li key={item}>{item}</li>)}</ul><label className="agent-consent"><input type="checkbox" checked={resumeConsented} onChange={e => setResumeConsented(e.target.checked)}/>我已重新阅读披露摘要并同意继续发送任务所需的最小数据。</label><button className="practice-primary" type="button" onClick={() => void submitResume(selected)} disabled={!resumeConsented || Boolean(busy) || !selected.operation_id || selected.generation === undefined}>同意并恢复此任务</button></>}</div> : null}
+      {selected.status === "interrupted" && selected.resumable === false ? <Notice tone="warn">此任务不可恢复：{selected.stop_reason || "服务端未标记为可恢复。"}</Notice> : null}
       <div className="agent-steps"><h4>工具步骤与状态</h4>{events.length ? <ol>{events.map(item => <li key={item.seq}><span>{KIND[item.kind] ?? item.kind}</span>{item.tool_name ? <code>{item.tool_name}</code> : null}<p>{item.summary}</p>{item.reason ? <small>{item.reason}</small> : null}{item.evidence_ids.length ? <small>证据：{item.evidence_ids.join("、")}</small> : null}</li>)}</ol> : <p className="agent-muted">{ACTIVE.has(selected.status) ? "等待服务端事件…" : "没有事件记录。"}</p>}</div>
       {selected.result ? <div className="agent-result"><h4>结论</h4><p className="agent-result-text">{selected.result.summary}</p>{selected.result.limitations.length ? <div><h4>数据与结论限制</h4><ul>{selected.result.limitations.map((item, i) => <li key={`${i}-${item}`}>{item}</li>)}</ul></div> : null}
         {selected.result.evidence.length ? <div><h4>证据引用</h4><div className="agent-evidence-list">{selected.result.evidence.map((item, i) => { const data = item.data && typeof item.data === "object" && !Array.isArray(item.data) ? item.data as Record<string, unknown> : null; return <details key={item.evidence_id ?? i}><summary>{item.tool_name ?? "工具结果"} · {item.as_of ?? "日期未知"} · {item.evidence_id ?? `证据 ${i + 1}`}</summary><p>{item.summary ?? "核对证据摘要与固定版本引用。"}</p><dl><div><dt>版本</dt><dd>{item.version_id ?? stringify(item.version)}</dd></div>{data ? Object.entries(data).slice(0, 30).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{evidenceValue(key, value)}</dd></div>) : null}</dl>{!data && item.data !== undefined ? <pre>{stringify(item.data)}</pre> : null}</details>; })}</div></div> : null}

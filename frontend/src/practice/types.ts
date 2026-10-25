@@ -5,6 +5,23 @@ export interface PracticeSource {
   limitations: string[];
 }
 
+export interface ResearchSourceContext {
+  practice_id: string;
+  revision: number;
+  revealed_date: string;
+  data_version_id: string;
+  source_code: string;
+  source_instance_id: string;
+  settings_fingerprint: string;
+  algorithm_fingerprint: string;
+  fee_fingerprint: string;
+  segment_fingerprint: string;
+}
+
+export type ResearchContextAvailability =
+  | { availability: "available"; source_context: ResearchSourceContext }
+  | { availability: "supplementation_required"; reason: string; missing_fields: string[] };
+
 export interface PracticePosition {
   ts_code: string;
   shares: number;

@@ -7,6 +7,9 @@
 from __future__ import annotations
 
 import logging
+import importlib
+import inspect
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -19,6 +22,7 @@ from . import DISPLAY_NAME, MODE, SERVICE_NAME, __version__
 from .api.portfolio import create_portfolio_router
 from .api.practice import create_practice_router
 from .api.agent import create_agent_router
+from .api.maintenance import create_maintenance_router
 from .agent_runtime.manager import AgentTaskManager
 from .agent_runtime.store import AgentStore
 from .config import Settings, load_settings
@@ -44,6 +48,21 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _optional_router(module_name: str, factory_name: str, settings: Settings):
+    """Load phase-6 domain routers when their owning slice is integrated."""
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name in {module_name, module_name.rpartition(".")[0]}:
+            return None
+        raise
+    factory = getattr(module, factory_name, None)
+    if not callable(factory):
+        return None
+    parameters = inspect.signature(factory).parameters
+    return factory(settings) if parameters else factory()
+
+
 def _database_payload(status: DatabaseStatus) -> dict:
     if status.ready and status.metadata is not None:
         return {
@@ -66,6 +85,10 @@ def create_app(settings: Settings | None = None, *, agent_gateway=None, agent_to
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        data_operations = None
+        data_operations_started = False
+        research_executor = None
+        research_executor_started = False
         app.state.settings = resolved
         app.state.startup_database_error = None
         try:
@@ -80,9 +103,51 @@ def create_app(settings: Settings | None = None, *, agent_gateway=None, agent_to
             app.state.agent_storage_error = getattr(exc, "reason", "agent_storage_unavailable")
             logger.warning("Agent任务存储不可用（%s）", app.state.agent_storage_error)
         try:
+            data_operations = importlib.import_module("app.practice_data.operations")
+            start_operations = getattr(data_operations, "startup_operations", None)
+            if callable(start_operations):
+                start_operations(resolved)
+                data_operations_started = True
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"app.practice_data.operations", "app.practice_data", "app"}:
+                logger.warning("练习数据任务生命周期不可用（%s）", getattr(exc, "name", "unknown"))
+        try:
+            research_executor = importlib.import_module("app.research.executor")
+            start_research = getattr(research_executor, "startup_research_executor", None)
+            if callable(start_research):
+                start_research(resolved)
+                research_executor_started = True
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"app.research.executor", "app.research", "app"}:
+                logger.warning("Research executor lifecycle unavailable (%s)", getattr(exc, "name", "unknown"))
+        try:
             yield
         finally:
-            await agent_manager.shutdown()
+            try:
+                await agent_manager.shutdown()
+            finally:
+                try:
+                    if data_operations_started and data_operations is not None:
+                        close_operations = getattr(data_operations, "shutdown_operations", None)
+                        if callable(close_operations):
+                            await asyncio.to_thread(close_operations, wait=True)
+                finally:
+                    try:
+                        if research_executor_started and research_executor is not None:
+                            close_research = getattr(research_executor, "shutdown_research_executor", None)
+                            if callable(close_research):
+                                await asyncio.to_thread(close_research, wait=True)
+                    finally:
+                        try:
+                            credentials = importlib.import_module("app.credentials")
+                            close_process = getattr(credentials, "close_process_credentials", None)
+                            if callable(close_process):
+                                close_process(resolved.runtime_dir)
+                        except ModuleNotFoundError as exc:
+                            if exc.name not in {"app.credentials", "app"}:
+                                logger.warning("Credential cleanup module unavailable (%s)", getattr(exc, "name", "unknown"))
+                        except Exception:
+                            logger.warning("Credential cleanup could not be completed")
 
     app = FastAPI(
         title=DISPLAY_NAME,
@@ -127,6 +192,12 @@ def create_app(settings: Settings | None = None, *, agent_gateway=None, agent_to
     app.include_router(create_portfolio_router())
     app.include_router(create_practice_router())
     app.include_router(create_agent_router(resolved, agent_store, agent_manager, agent_gateway, agent_tools))
+    app.include_router(create_maintenance_router(resolved))
+    for module_name, factory_name in (("app.api.research", "create_research_router"),
+                                      ("app.api.credentials", "create_credentials_router")):
+        optional = _optional_router(module_name, factory_name, resolved)
+        if optional is not None:
+            app.include_router(optional)
 
     @app.get("/api/health")
     def health() -> dict:

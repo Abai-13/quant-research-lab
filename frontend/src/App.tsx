@@ -2,12 +2,13 @@ import { useEffect, useState } from "react";
 
 import { DiagnosticsPage } from "./DiagnosticsPage";
 import { PracticeWorkspace } from "./practice/PracticeWorkspace";
+import { ResearchSettings } from "./phase6/ResearchSettings";
 import "./practice.css";
 
-type View = "practice" | "diagnostics";
+type View = "practice" | "research" | "diagnostics";
 
 function readView(): View {
-  return window.location.hash === "#diagnostics" ? "diagnostics" : "practice";
+  return window.location.hash === "#diagnostics" ? "diagnostics" : window.location.hash === "#research" ? "research" : "practice";
 }
 
 export default function App() {
@@ -24,11 +25,7 @@ export default function App() {
       return;
     }
     const url = new URL(window.location.href);
-    if (next === "diagnostics") {
-      url.hash = "diagnostics";
-    } else {
-      url.hash = "";
-    }
+    url.hash = next === "diagnostics" ? "diagnostics" : next === "research" ? "research" : "";
     window.history.replaceState({}, "", url);
     setView(next);
   }
@@ -42,6 +39,14 @@ export default function App() {
             <span>AI 量化模拟交易系统</span>
           </div>
           <nav className="app-tabs" aria-label="页面导航">
+            <button
+              type="button"
+              className={`app-tab ${view === "research" ? "app-tab-active" : ""}`}
+              aria-current={view === "research" ? "page" : undefined}
+              onClick={() => switchView("research")}
+            >
+              研究与凭据
+            </button>
             <button
               type="button"
               className={`app-tab ${view === "practice" ? "app-tab-active" : ""}`}
@@ -67,6 +72,8 @@ export default function App() {
           <div className="page practice-page-shell">
             <PracticeWorkspace />
           </div>
+        ) : view === "research" ? (
+          <ResearchSettings />
         ) : (
           <DiagnosticsPage />
         )}

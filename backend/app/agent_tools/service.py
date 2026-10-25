@@ -43,7 +43,8 @@ _TOOLS: list[dict[str, Any]] = [
 
 def tool_definitions() -> list[dict[str, Any]]:
     """Return a JSON-safe copy of the strict OpenAI function schemas."""
-    return json.loads(json.dumps(_TOOLS))
+    from .research import research_tool_definitions
+    return json.loads(json.dumps(_TOOLS + research_tool_definitions()))
 
 
 def _fingerprint(value: Mapping[str, Any]) -> str:
@@ -120,7 +121,7 @@ def capture_context(settings: Settings, practice_id: str | None, expected_revisi
             "model_context": {
                 "scope": "simulation", "as_of": binding["revealed_date"],
                 "source_code": binding["source_code"], "data_version_id": binding["data_version_id"],
-                "status": binding["status"], "permissions": ["read_revealed_state", "deterministic_preview", "bounded_analysis", "draft_only"],
+                "status": binding["status"], "permissions": ["read_revealed_state", "deterministic_preview", "bounded_analysis", "search_visible_research", "read_visible_research", "prepare_experiment_draft", "inspect_experiment_status", "draft_only"],
             },
             "limitations": ["只可读取当前已揭晓数据；Agent不能推进模拟或提交订单。", "模型上下文不包含姓名、隐藏系统提示或未来行情。"],
         }
@@ -241,11 +242,24 @@ def _source_quality(conn: sqlite3.Connection, session: Mapping[str, Any]) -> dic
 
 def execute_tool(settings: Settings, context: Mapping[str, Any], name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Execute one allowlisted, bounded deterministic tool."""
-    if name not in {"prepare_setup_draft", "get_simulation_state", "get_source_quality", "preview_trade", "compare_review", "bounded_analysis"}:
+    research_names = {"search_research_records", "read_research_record", "prepare_experiment_draft", "get_experiment_status"}
+    if name not in {"prepare_setup_draft", "get_simulation_state", "get_source_quality", "preview_trade", "compare_review", "bounded_analysis", *research_names}:
         raise PracticeError("tool_unknown", "未知工具。")
     if not isinstance(arguments, dict):
         raise PracticeError("tool_arguments_invalid", "工具参数必须为 JSON 对象。")
     validate_context(settings, context)
+    if name in research_names:
+        from .research import invoke_research_tool
+        expected = {
+            "search_research_records": ({"query", "kind", "limit"}, {"query", "limit"}),
+            "read_research_record": ({"record_id"}, {"record_id"}),
+            "prepare_experiment_draft": ({"plan"}, {"plan"}),
+            "get_experiment_status": ({"experiment_id"}, {"experiment_id"}),
+        }
+        allowed, required = expected[name]
+        _require_keys(arguments, allowed, required)
+        data = invoke_research_tool(settings, context, name, arguments)
+        return _output(context, name, data, "研究工具仅返回当前模拟时点可见证据；未启动封存评估，也未修改正式策略。")
     if name == "prepare_setup_draft":
         if context.get("scope") != "setup":
             raise PracticeError("setup_scope_required", "设置草稿仅允许在未绑定模拟时生成。")

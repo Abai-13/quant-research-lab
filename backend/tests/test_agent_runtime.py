@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import pytest
 
-from app.agent_runtime.engine import AgentEngine, RuntimeErrorCode, validate_arguments
-from app.agent_runtime.store import AgentStore, IdempotencyConflict
+from app.agent_runtime.engine import AgentEngine, RuntimeErrorCode, _estimate_input_tokens, validate_arguments
+from app.agent_runtime.store import AgentStore, IdempotencyConflict, canonical
 
 
 class FakeTools:
@@ -18,6 +18,21 @@ class FakeTools:
     def execute_tool(self,settings,context,name,arguments):
         self.calls.append((name,arguments))
         return {"data":{"symbol":arguments["symbol"]},"evidence":[{"evidence_id":"ev-1","as_of":"2026-01-01"}],"drafts":[],"limitations":[],"context_fingerprint":"fp"}
+
+
+class ResearchTools(FakeTools):
+    def tool_definitions(self):
+        return super().tool_definitions()+[{
+            "type":"function","function":{"name":"search_research_records","description":"search visible research",
+                "parameters":{"type":"object","properties":{"query":{"type":"string"}},
+                              "required":["query"],"additionalProperties":False}},
+        }]
+
+    def execute_tool(self, settings, context, name, arguments):
+        if name == "search_research_records":
+            self.calls.append((name, arguments))
+            return {"data":{"records":[]},"evidence":[],"drafts":[],"limitations":[],"context_fingerprint":"fp"}
+        return super().execute_tool(settings,context,name,arguments)
 
 
 class FakeGateway:
@@ -35,7 +50,7 @@ class FakeGateway:
 
 def model_response(*,content=None,calls=None,total=20):
     return {"message":{"role":"assistant","content":content,"tool_calls":calls or []},
-            "usage":{"input_tokens":10,"output_tokens":10,"total_tokens":total}}
+            "usage":{"input_tokens":min(10,total),"output_tokens":max(0,total-min(10,total)),"total_tokens":total}}
 
 
 def make_task(store):
@@ -62,6 +77,84 @@ def test_dynamic_tool_branch_and_evidence(tmp_path):
     assert result["summary"].endswith("ev-1.")
     assert result["evidence"][0]["evidence_id"]=="ev-1"
     assert usage["model_calls"]==2 and usage["tool_calls"]==1
+
+
+def test_input_preflight_counts_ascii_bytes_and_cjk_codepoints():
+    ascii_payload={"schema":"function properties additionalProperties false"}
+    assert _estimate_input_tokens(ascii_payload)==len(canonical(ascii_payload).encode("utf-8"))
+
+    cjk_payload={"text":"研究"}
+    serialized=canonical(cjk_payload)
+    expected=len(serialized.encode("utf-8"))-len("研究".encode("utf-8"))+len("研究")
+    assert _estimate_input_tokens(cjk_payload)==expected
+
+
+def test_model_tool_descriptions_are_compact_and_research_tools_remain_available(tmp_path):
+    store=AgentStore(tmp_path/"tasks.sqlite3"); store.initialize()
+    task,context=make_task(store)
+    tools=ResearchTools()
+    gateway=FakeGateway([
+        model_response(calls=[{"id":"research-call-1","type":"function","function":{
+            "name":"search_research_records","arguments":"{\"query\":\"supporting evidence\"}"}}]),
+        model_response(content="Done."),
+    ])
+    asyncio.run(AgentEngine(settings=object(),store=store,gateway=gateway,tools=tools).run(
+        task,context=context,cancel_event=asyncio.Event()))
+    offered=[item["function"]["name"] for item in gateway.requests[0][0][3]]
+    assert offered==["lookup","search_research_records"]
+    model_research_schema=gateway.requests[0][0][3][1]["function"]
+    source_research_schema=ResearchTools().tool_definitions()[1]["function"]
+    assert model_research_schema["description"]=="搜索可见研究记录"
+    assert model_research_schema["parameters"]==source_research_schema["parameters"]
+    assert tools.calls==[("search_research_records",{"query":"supporting evidence"})]
+
+    research_store=AgentStore(tmp_path/"research.sqlite3"); research_store.initialize()
+    research_context={"scope":"simulation","practice_id":"practice-1","revision":1,
+                      "context_fingerprint":"fp","model_context":{"scope":"simulation"},"limitations":[]}
+    research_task,_=research_store.create(key="idem-research-123",payload={"goal":"整理研究记录"},
+        practice_id="practice-1",scope="simulation",goal="整理研究记录",config_version="v1",
+        context=research_context,consent_digest="e"*64,
+        limits={"rounds":8,"tool_calls":20,"timeout_seconds":120,"tokens":4096})
+    research_store.start(research_task["task_id"])
+    research_task=research_store.get(research_task["task_id"])
+    research_gateway=FakeGateway([model_response(content="Done.")])
+    asyncio.run(AgentEngine(settings=object(),store=research_store,gateway=research_gateway,tools=ResearchTools()).run(
+        research_task,context=research_context,cancel_event=asyncio.Event()))
+    research_offered=[item["function"]["name"] for item in research_gateway.requests[0][0][3]]
+    assert research_offered==["lookup","search_research_records"]
+
+
+def test_chinese_multiround_prompt_uses_budget_estimate_and_actual_usage(tmp_path):
+    store=AgentStore(tmp_path/"tasks.sqlite3"); store.initialize()
+    task,context=make_task(store)
+    context["model_context"]={"已知研究背景":"研究资料需要按已揭晓日期核对。"*120}
+    tools=FakeTools()
+    gateway=FakeGateway([
+        model_response(calls=[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{\"symbol\":\"600000.SH\"}"}}]),
+        model_response(content="已依据证据 ev-1 完成核对。"),
+    ])
+    result,reason,usage=asyncio.run(AgentEngine(settings=object(),store=store,gateway=gateway,tools=tools).run(
+        task,context=context,cancel_event=asyncio.Event()))
+    assert reason is None
+    assert result["summary"]=="已依据证据 ev-1 完成核对。"
+    assert len(gateway.requests)==2
+    assert all(0 < request[1]["max_output_tokens"] <= 1_024 for request in gateway.requests)
+    assert usage["input_tokens"]==20
+    assert usage["output_tokens"]==20
+    assert usage["total_tokens"]==40 <= task["limits"]["tokens"]
+
+
+def test_reported_usage_still_enforces_hard_cumulative_limit(tmp_path):
+    store=AgentStore(tmp_path/"tasks.sqlite3"); store.initialize()
+    task,context=make_task(store)
+    task["limits"]["tokens"]=1_000
+    gateway=FakeGateway([model_response(content="This response exceeds the actual usage budget.",total=1_001)])
+    with pytest.raises(RuntimeErrorCode) as caught:
+        asyncio.run(AgentEngine(settings=object(),store=store,gateway=gateway,tools=FakeTools()).run(
+            task,context=context,cancel_event=asyncio.Event()))
+    assert caught.value.reason=="token_budget_exhausted"
+    assert len(gateway.requests)==1
+    assert store.get(task["task_id"])["usage"]["total_tokens"]==1_001
 
 
 @pytest.mark.parametrize("call,reason",[
@@ -92,7 +185,7 @@ def test_cancel_fence_discards_late_model_result(tmp_path):
 
 def test_preflight_reserves_serialized_input_and_tool_schema(tmp_path):
     store=AgentStore(tmp_path/"tasks.sqlite3"); store.initialize(); task,context=make_task(store)
-    context["model_context"]={"bounded":"x"*5_000}
+    context["model_context"]={"bounded":"x"*9_000}
     gateway=FakeGateway([model_response(content="should not be requested")])
     engine=AgentEngine(settings=object(),store=store,gateway=gateway,tools=FakeTools())
     with pytest.raises(RuntimeErrorCode) as caught:

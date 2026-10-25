@@ -118,6 +118,35 @@
   gap: 0;
 }
 
+.phase6-card { background: #fff; border: 1px solid #dce4ee; border-radius: 14px; padding: 22px; margin: 22px 0; box-shadow: 0 5px 18px #18304c0a; }
+.phase6-card h2 { margin: 0 0 12px; }
+.phase6-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; align-items: end; }
+.phase6-wide { grid-column: 1 / -1; }
+.phase6-actions, .phase6-tabs { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.phase6-operation, .phase6-result, .phase6-plan, .phase6-detail { margin-top: 18px; padding: 16px; border-radius: 10px; background: #f5f8fc; border: 1px solid #dce4ee; }
+.phase6-operation > div:first-child { display: flex; flex-wrap: wrap; gap: 16px; }
+.phase6-operation p, .phase6-result p { overflow-wrap: anywhere; }
+.phase6-error { color: #9f2c2c; background: #fff1ef; border: 1px solid #f0c1ba; border-radius: 8px; padding: 10px 12px; }
+.phase6-columns { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(280px, .75fr); gap: 18px; align-items: start; }
+.phase6-inline { display: flex; gap: 8px; margin: 12px 0; }
+.phase6-inline input { flex: 1; min-width: 0; }
+.phase6-list { list-style: none; padding: 0; margin: 0; }
+.phase6-list li { display: flex; justify-content: space-between; gap: 10px; padding: 9px 0; border-bottom: 1px solid #e5ebf2; }
+.phase6-list li span { color: #67778b; font-size: .85rem; }
+.phase6-form { display: grid; gap: 12px; margin: 14px 0; }
+.phase6-detail dl, .phase6-plan dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.phase6-detail dl > div, .phase6-plan dl > div { min-width: 0; padding: 9px; background: #fff; border-radius: 7px; }
+.phase6-detail dt, .phase6-plan dt { color: #67778b; font-size: .82rem; }
+.phase6-detail dd, .phase6-plan dd { margin: 4px 0 0; overflow-wrap: anywhere; }
+.phase6-json { max-height: 440px; overflow: auto; padding: 12px; background: #101923; color: #e3edf6; border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.phase6-credential { border-top: 1px solid #e5ebf2; padding: 16px 0; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.phase6-credential h3 { margin: 0; }
+.phase6-credential p { color: #53657a; overflow-wrap: anywhere; }
+.phase6-credential-form { display: grid; gap: 10px; }
+.phase6-page { max-width: 1440px; }
+@media (max-width: 850px) { .phase6-columns { grid-template-columns: 1fr; } .phase6-credential { grid-template-columns: 1fr; } }
+@media (max-width: 600px) { .phase6-grid, .phase6-detail dl, .phase6-plan dl { grid-template-columns: 1fr; } .phase6-wide { grid-column: auto; } .phase6-list li { flex-direction: column; } .phase6-card { padding: 15px; } }
+
 .practice-hero {
   display: grid;
   grid-template-columns: minmax(0, 1.6fr) minmax(240px, 0.7fr);

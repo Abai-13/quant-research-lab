@@ -10,6 +10,8 @@ import { formatDate, isFinished } from "./format";
 import { NewPracticeForm } from "./NewPracticeForm";
 import { EmptyState, Notice, SectionHeading, StatusBadge, sourceLabel, type Tone } from "./ui";
 import { AgentPanel } from "./AgentPanel";
+import { DataPreparation } from "../phase6/DataPreparation";
+import type { PreparedDataset } from "../phase6/types";
 
 function summaryMeta(session: PracticeSummary): string {
   const parts = [formatDate(session.start_date), formatDate(session.end_date)];
@@ -111,6 +113,19 @@ export function HomeView({
       <AgentPanel onSetupDraft={(payload) => {
         setSetupDraft(payload);
         setSetupDraftApplied(true);
+        window.setTimeout(() => document.getElementById("new-practice-heading")?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
+      }} />
+      <DataPreparation onUseDataset={(dataset: PreparedDataset) => {
+        const weekday = (value: string, direction: 1 | -1) => {
+          const date = new Date(`${value}T00:00:00Z`);
+          while (date.getUTCDay() === 0 || date.getUTCDay() === 6) date.setUTCDate(date.getUTCDate() + direction);
+          return date.toISOString().slice(0, 10);
+        };
+        const startDate = dataset.synthetic ? weekday(dataset.start_date, 1) : dataset.start_date;
+        const endDate = dataset.synthetic ? weekday(dataset.end_date, -1) : dataset.end_date;
+        setSetupDraft({ name: dataset.synthetic ? "合成示例模拟" : "历史数据模拟", start_date: startDate, end_date: endDate, source_code: dataset.source_code, data_version_id: dataset.data_version_id });
+        setSetupDraftApplied(true);
+        onReloadOptions();
         window.setTimeout(() => document.getElementById("new-practice-heading")?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
       }} />
       {setupDraftApplied ? <Notice tone="ok">Agent 条件草稿已填入创建模拟表单。请检查日期、资金、数据版本和持仓后再手动创建。</Notice> : null}

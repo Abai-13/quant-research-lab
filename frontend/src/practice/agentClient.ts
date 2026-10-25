@@ -37,4 +37,5 @@ export const getAgentTasks = (practiceId: string | null) => request<{ tasks: Age
 export const getAgentTask = (id: string) => request<AgentTask>(`/tasks/${encodeURIComponent(id)}`);
 export const getAgentEvents = (id: string, after: number) => request<{ events: AgentEvent[]; next_seq: number }>(`/tasks/${encodeURIComponent(id)}/events?after_seq=${after}&limit=100`);
 export const cancelAgentTask = (id: string, idempotency_key: string) => request<AgentTask>(`/tasks/${encodeURIComponent(id)}/cancel`, { method: "POST", body: JSON.stringify({ idempotency_key }) });
+export const resumeAgentTask = (operationId: string, body: { consent: true; expected_generation: number; config_version: string; consent_digest: string; idempotency_key: string }) => request<AgentTask>(`/operations/${encodeURIComponent(operationId)}/resume`, { method: "POST", body: JSON.stringify(body) });
 export const deleteAgentTask = (id: string) => request<{ ok: true }>(`/tasks/${encodeURIComponent(id)}`, { method: "DELETE" });

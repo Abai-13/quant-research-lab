@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..agent_runtime.manager import AgentTaskManager
 from ..agent_runtime.store import ActiveTaskError, AgentStore, IdempotencyConflict, canonical
+from ..agent_runtime.operation import operation_view
 from ..config import Settings
 
 
@@ -49,6 +50,15 @@ class TaskBody(BaseModel):
 class CancelBody(BaseModel):
     model_config=ConfigDict(extra="forbid")
     idempotency_key:str=Field(min_length=8,max_length=160)
+    expected_generation:int|None=Field(default=None,ge=1)
+
+class ResumeBody(BaseModel):
+    model_config=ConfigDict(extra="forbid")
+    expected_generation:int=Field(ge=1)
+    consent:bool
+    config_version:str
+    consent_digest:str=Field(min_length=64,max_length=64)
+    idempotency_key:str=Field(min_length=8,max_length=160)
 
 
 def _service(name:str)->Any:
@@ -69,9 +79,24 @@ def _config_payload(config_result:dict[str,Any])->tuple[str,dict[str,Any]]:
         raise HTTPException(409,detail={"ok":False,"reason":"agent_not_configured","detail":"Configure an Agent provider first."})
     return str(config.get("config_version") or ""),config
 
+def _credential_generation(settings:Settings, config:dict[str,Any])->str|None:
+    try:
+        credentials=importlib.import_module("app.credentials")
+    except ModuleNotFoundError as exc:
+        if exc.name in {"app.credentials","app"}:
+            value=config.get("credential_generation")
+            return str(value) if value is not None else None
+        raise
+    reader=getattr(credentials,"credential_generation",None)
+    if callable(reader):
+        return str(reader(settings.runtime_dir,"model"))
+    value=config.get("credential_generation")
+    return str(value) if value is not None else None
+
 def _disclosure(settings:Settings,gateway:Any,tools:Any,practice_id:str|None,expected_revision:int|None,limits_override:dict[str,Any]|None=None)->tuple[dict[str,Any],dict[str,Any]]:
     try:
         public=_public_config(gateway,settings); config_version,config=_config_payload(public)
+        credential_generation=_credential_generation(settings,config)
         context=tools.capture_context(settings,practice_id,expected_revision)
         tools.validate_context(settings,context)
         if not isinstance(context,dict) or context.get("scope") not in {"setup","simulation"}:
@@ -103,11 +128,13 @@ def _disclosure(settings:Settings,gateway:Any,tools:Any,practice_id:str|None,exp
     categories=["user_goal","current_simulation_context","tool_evidence","generated_drafts"]
     binding={"config_version":config_version,"target":target,"context_fingerprint":context.get("context_fingerprint"),
              "practice_id":context.get("practice_id"),"revision":context.get("revision"),"revealed_date":context.get("revealed_date"),
-             "data_version_id":context.get("data_version_id"),"data_categories":categories,"limits":limits}
+             "data_version_id":context.get("data_version_id"),"credential_generation":credential_generation,
+             "data_categories":categories,"limits":limits}
     consent_digest=hashlib.sha256(canonical(binding).encode("utf-8")).hexdigest()
     disclosure={"config_version":config_version,"target":target,"context":{k:context.get(k) for k in
         ("scope","practice_id","revision","revealed_date","data_version_id","source_code","context_fingerprint","limitations")},
-        "data_categories":categories,"purpose":"Research assistance for the bound historical simulation; evidence and drafts only.",
+        "data_categories":categories,"credential_generation":credential_generation,
+        "purpose":"Research assistance for the bound historical simulation; evidence and drafts only.",
         "possible_cost":True,"limits":limits,"consent_digest":consent_digest}
     return disclosure,context
 
@@ -197,7 +224,8 @@ def create_agent_router(settings:Settings,store:AgentStore|None=None,manager:Age
         try:
             view,created=agent_store.create(key=body.idempotency_key,payload=body.model_dump(),practice_id=body.practice_id,
                 scope=str(context.get("scope")),goal=body.goal,config_version=body.config_version,context=context,
-                consent_digest=body.consent_digest,limits=effective_limits,parent_task_id=body.parent_task_id)
+                consent_digest=body.consent_digest,limits=effective_limits,parent_task_id=body.parent_task_id,
+                credential_generation=disclosure.get("credential_generation"))
         except IdempotencyConflict:
             raise HTTPException(409,detail={"ok":False,"reason":"idempotency_conflict","detail":"Idempotency key was already used with a different payload."}) from None
         except ValueError as exc:
@@ -226,9 +254,63 @@ def create_agent_router(settings:Settings,store:AgentStore|None=None,manager:Age
 
     @router.post("/tasks/{task_id}/cancel")
     async def cancel_task(task_id:str,body:CancelBody):
-        row=await task_manager.cancel(task_id)
+        current=agent_store.get(task_id)
+        if current is None:raise HTTPException(404,detail={"ok":False,"reason":"task_not_found","detail":"Task not found."})
+        expected=body.expected_generation or current["generation"]
+        if current["generation"]!=expected:raise HTTPException(409,detail={"ok":False,"reason":"generation_conflict","detail":"Operation changed; refresh its status."})
+        row=await task_manager.cancel(task_id,expected)
         if not row:raise HTTPException(404,detail={"ok":False,"reason":"task_not_found","detail":"Task not found."})
         return {k:v for k,v in row.items() if k not in ("consent_digest","limits","attempt")}
+
+    @router.get("/operations/{operation_id}")
+    def inspect_operation(operation_id:str):
+        row=agent_store.get(operation_id)
+        if not row:raise HTTPException(404,detail={"ok":False,"reason":"operation_not_found","detail":"Operation not found."})
+        row=_refresh_stale(row,settings,agent_store,tools)
+        return operation_view(row)
+
+    @router.post("/operations/{operation_id}/cancel")
+    async def cancel_operation(operation_id:str,body:CancelBody):
+        row=agent_store.get(operation_id)
+        if not row:raise HTTPException(404,detail={"ok":False,"reason":"operation_not_found","detail":"Operation not found."})
+        if body.expected_generation is None or row["generation"]!=body.expected_generation:
+            raise HTTPException(409,detail={"ok":False,"reason":"generation_conflict","detail":"Submit the current operation generation."})
+        cancelled=await task_manager.cancel(operation_id,body.expected_generation)
+        if not cancelled:raise HTTPException(409,detail={"ok":False,"reason":"generation_conflict","detail":"Operation changed; refresh its status."})
+        return operation_view(cancelled)
+
+    @router.post("/operations/{operation_id}/resume",status_code=202)
+    async def resume_operation(operation_id:str,body:ResumeBody):
+        if body.consent is not True:raise HTTPException(400,detail={"ok":False,"reason":"consent_required","detail":"Explicit renewed consent is required."})
+        row=agent_store.get(operation_id)
+        if not row:raise HTTPException(404,detail={"ok":False,"reason":"operation_not_found","detail":"Operation not found."})
+        resume_payload=body.model_dump()
+        try:
+            duplicate=agent_store.resume_existing(operation_id,idempotency_key=body.idempotency_key,payload=resume_payload)
+        except IdempotencyConflict:
+            raise HTTPException(409,detail={"ok":False,"reason":"idempotency_conflict","detail":"Resume key was already used with a different request."}) from None
+        if duplicate is not None:
+            return operation_view(duplicate)
+        if row["generation"]!=body.expected_generation or row["status"]!="interrupted":
+            raise HTTPException(409,detail={"ok":False,"reason":"generation_conflict","detail":"Operation changed; refresh its status."})
+        gw=gateway or _service("app.agent_gateway"); tl=tools or _service("app.agent_tools")
+        disclosure,context=await asyncio.to_thread(_disclosure,settings,gw,tl,row["practice_id"],row["context"].get("revision"),row["limits"])
+        if (body.config_version!=row["config_version"] or disclosure["config_version"]!=body.config_version
+                or body.consent_digest!=disclosure["consent_digest"]
+                or (str(disclosure.get("credential_generation")) if disclosure.get("credential_generation") is not None else None)!=row.get("credential_generation")
+                or context.get("context_fingerprint")!=row["context"].get("context_fingerprint")):
+            agent_store.mark_stale(operation_id)
+            raise HTTPException(409,detail={"ok":False,"reason":"resume_binding_stale","detail":"Context, provider configuration, or renewed disclosure changed."})
+        try:
+            claimed=agent_store.claim_resume(operation_id,body.expected_generation,idempotency_key=body.idempotency_key,payload=resume_payload)
+        except IdempotencyConflict:
+            raise HTTPException(409,detail={"ok":False,"reason":"idempotency_conflict","detail":"Resume key was already used with a different request."}) from None
+        if claimed is None:
+            raise HTTPException(409,detail={"ok":False,"reason":"resume_unsafe","detail":"This checkpoint cannot be resumed without risking duplicate work or resetting budgets."})
+        claimed,created=claimed
+        # The new generation is fenced into every subsequent persistence call.
+        if created:await task_manager.launch(operation_id,context)
+        return operation_view(claimed)
 
     @router.delete("/tasks/{task_id}")
     def delete_task(task_id:str):

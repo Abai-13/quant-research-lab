@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Query, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.data.chunks import VersionView
 from app.data.chunks import version_members
@@ -38,6 +42,50 @@ _RECORD_TABLES = {
     "suspension": "suspension_event",
     "corporate_action": "corporate_action",
 }
+
+
+class ResearchSourceContext(BaseModel):
+    """Exact source binding accepted by the frozen research-plan contract."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    practice_id: str = Field(min_length=1, max_length=100)
+    revision: int = Field(ge=1)
+    revealed_date: str = Field(pattern=r"^\d{8}$")
+    data_version_id: str = Field(min_length=1, max_length=200)
+    source_code: str = Field(min_length=1, max_length=100)
+    source_instance_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    settings_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    algorithm_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    fee_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    segment_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ResearchContextAvailable(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: Literal[True]
+    availability: Literal["available"]
+    source_context: ResearchSourceContext
+
+
+class ResearchContextSupplementationRequired(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: Literal[True]
+    availability: Literal["supplementation_required"]
+    reason: str
+    missing_fields: list[str]
+
+
+ResearchContextResponse = ResearchContextAvailable | ResearchContextSupplementationRequired
+
+
+_RESEARCH_SOURCE_FIELDS = (
+    "practice_id", "revision", "revealed_date", "data_version_id", "source_code",
+    "source_instance_id", "settings_fingerprint", "algorithm_fingerprint",
+    "fee_fingerprint", "segment_fingerprint",
+)
 
 
 def _install_demo_seed(target: sqlite3.Connection, seeded: dict[str, Any]) -> dict[str, Any]:
@@ -182,7 +230,10 @@ def create_practice_router() -> APIRouter:
             "limitations": limitations,
         }
 
-    def view(conn: sqlite3.Connection, session: dict[str, Any]) -> dict[str, Any]:
+    def view(conn: sqlite3.Connection, session: dict[str, Any], settings=None) -> dict[str, Any]:
+        if settings is not None:
+            from app.research.exposure import capture_practice_exposure
+            capture_practice_exposure(settings, conn, session)
         try:
             from app.practice.comparison import get_comparison
         except ImportError as exc:
@@ -313,8 +364,8 @@ def create_practice_router() -> APIRouter:
             "data_version_id": version_id,
         }
         settings["pool_snapshot_id"] = pool_snapshot_id
-        if settings.get("rebalance_every_n_days") != 5:
-            raise PracticeError("rebalance_schedule_frozen", "首版系统路径固定每5个已揭晓交易日检查")
+        if type(settings.get("rebalance_every_n_days")) is not int or settings.get("rebalance_every_n_days") not in {5, 10, 20}:
+            raise PracticeError("rebalance_schedule_invalid", "调仓间隔仅支持已验证的 5、10、20 个交易日")
         if not isinstance(settings.get("hide_system_hints"), bool):
             raise PracticeError("settings_invalid", "hide_system_hints 必须为布尔值")
         for field, low, high in (("max_single_name_weight_bp", 1, 10_000), ("min_cash_reserve_bp", 0, 10_000)):
@@ -511,7 +562,7 @@ def create_practice_router() -> APIRouter:
                 if replay is not None:
                     return replay
                 session = create_session(conn, payload=body)
-                response = {"ok": True, "session": view(conn, session)}
+                response = {"ok": True, "session": view(conn, session, request.app.state.settings)}
                 save_idempotency(conn, operation="create", key=body["idempotency_key"],
                                  request_hash=request_hash, practice_id=session["practice_id"], response=response)
                 return response
@@ -521,7 +572,99 @@ def create_practice_router() -> APIRouter:
     @router.get("/sessions/{practice_id}")
     def get_session(request: Request, practice_id: str):
         with connect(request) as conn:
-            return {"session": view(conn, require_session(conn, practice_id))}
+            return {"session": view(conn, require_session(conn, practice_id), request.app.state.settings)}
+
+    @router.get("/sessions/{practice_id}/research-context", response_model=ResearchContextResponse)
+    def research_context(request: Request, practice_id: str, expected_revision: int = Query(..., ge=1)):
+        """Return an exact frozen-plan source binding from the local practice snapshot.
+
+        This endpoint deliberately opens an existing practice database read-only;
+        it neither initializes storage nor asks an Agent/model for context.
+        """
+        from pathlib import Path
+
+        from app.config import load_settings
+        from app.data.errors import DataError
+        from app.practice.core import PracticeError
+        from app.practice.runtime import practice_settings
+
+        def unavailable(reason: str, missing: list[str]) -> dict[str, Any]:
+            return {
+                "ok": True, "availability": "supplementation_required",
+                "reason": reason, "missing_fields": missing,
+            }
+        settings = getattr(request.app.state, "settings", None) or load_settings()
+        path = practice_settings(settings).db_path
+        if not path.is_file():
+            return JSONResponse(status_code=404, content={"ok": False, "reason": "practice_not_found"})
+        try:
+            uri = Path(path).resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=3.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("PRAGMA foreign_keys=ON")
+            try:
+                session = require_session(conn, practice_id)
+                if int(session["revision"]) != expected_revision:
+                    return JSONResponse(status_code=409, content={"ok": False, "reason": "revision_conflict"})
+
+                segment_id = (session.get("segments") or {}).get("user")
+                segment = conn.execute(
+                    "SELECT rule_bundle_id,fee_bundle_id,input_sha256 FROM simulation_segment WHERE segment_id=?",
+                    (segment_id,),
+                ).fetchone() if segment_id else None
+                if segment is None:
+                    return unavailable("historical_context_incomplete", [
+                        "algorithm_fingerprint", "fee_fingerprint", "segment_fingerprint",
+                    ])
+
+                from app.portfolio.rule_bundles import load_rule_bundle
+
+                rule = load_rule_bundle(conn, str(segment[0]))
+                fee = load_rule_bundle(conn, str(segment[1]))
+                if rule is None or rule.get("kind") != "parameter":
+                    return unavailable("historical_context_incomplete", ["algorithm_fingerprint"])
+                if fee is None or fee.get("kind") != "fee":
+                    return unavailable("historical_context_incomplete", ["fee_fingerprint"])
+                settings_value = session.get("settings")
+                if not isinstance(settings_value, dict):
+                    return unavailable("historical_context_incomplete", ["settings_fingerprint"])
+
+                try:
+                    market = VersionView(conn, str(session["data_version_id"]), expected_source_code=str(session["source_code"]))
+                    calendar = market.calendar_days(on_or_before=str(session["revealed_date"]))
+                    if str(session["revealed_date"]) not in calendar:
+                        return unavailable("source_data_time_unavailable", ["revealed_date", "data_version_id"])
+                    if not market.securities():
+                        return unavailable("source_data_unavailable", ["data_version_id"])
+                except (DataError, sqlite3.Error, ValueError, TypeError):
+                    return unavailable("source_data_unavailable", ["data_version_id", "source_code"])
+
+                settings_json = json.dumps(settings_value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                source_context = ResearchSourceContext(
+                    practice_id=str(session["practice_id"]),
+                    revision=int(session["revision"]),
+                    revealed_date=str(session["revealed_date"]),
+                    data_version_id=str(session["data_version_id"]),
+                    source_code=str(session["source_code"]),
+                    source_instance_id=hashlib.sha256(str(settings.runtime_dir.resolve()).encode("utf-8")).hexdigest(),
+                    settings_fingerprint=hashlib.sha256(settings_json.encode("utf-8")).hexdigest(),
+                    algorithm_fingerprint=str(rule["content_sha256"]),
+                    fee_fingerprint=str(fee["content_sha256"]),
+                    segment_fingerprint=str(segment[2]),
+                )
+                return {
+                    "ok": True, "availability": "available",
+                    "source_context": source_context.model_dump(),
+                }
+            finally:
+                conn.close()
+        except PracticeError as exc:
+            if exc.reason == "session_not_found":
+                return JSONResponse(status_code=404, content={"ok": False, "reason": "practice_not_found"})
+            return unavailable("historical_context_incomplete", list(_RESEARCH_SOURCE_FIELDS))
+        except (sqlite3.Error, OSError, DataError, ValueError, TypeError):
+            return unavailable("practice_context_unavailable", list(_RESEARCH_SOURCE_FIELDS))
 
     @router.post("/sessions/{practice_id}/restart")
     def restart(request: Request, practice_id: str, body: dict[str, Any]):
@@ -539,7 +682,7 @@ def create_practice_router() -> APIRouter:
                            "positions": old["settings"]["initial_positions"], "data_version_id": old["data_version_id"],
                            "source_code": old["source_code"], "settings": old["settings"]}
                 new = create_session(conn, payload=payload, parent_id=practice_id)
-                response = {"ok": True, "session": view(conn, new)}
+                response = {"ok": True, "session": view(conn, new, request.app.state.settings)}
                 save_idempotency(conn, operation=f"restart:{practice_id}", key=body["idempotency_key"],
                                  request_hash=request_hash, practice_id=new["practice_id"], response=response)
                 return response
@@ -583,7 +726,7 @@ def create_practice_router() -> APIRouter:
                 user["orders"] = [*user.get("orders", []), {"order_id": order_id, "trade_date": trade_date,
                     "ts_code": code, "direction": direction, "planned_shares": shares, "status": "pending"}]
                 compare_and_update(conn, session, user_state=user)
-                response = {"ok": True, "session": view(conn, session)}
+                response = {"ok": True, "session": view(conn, session, request.app.state.settings)}
                 save_idempotency(conn, operation=f"order:{practice_id}", key=body["idempotency_key"],
                                  request_hash=request_hash, practice_id=practice_id, response=response)
                 return response
@@ -613,7 +756,7 @@ def create_practice_router() -> APIRouter:
                 user_state = refreshed_user_state(conn, session)
                 user_state["last_advance"] = advance_result
                 compare_and_update(conn, session, revealed_date=date, user_state=user_state)
-                response = {"ok": True, "session": view(conn, session)}
+                response = {"ok": True, "session": view(conn, session, request.app.state.settings)}
                 save_idempotency(conn, operation=f"advance:{practice_id}", key=body["idempotency_key"],
                                  request_hash=request_hash, practice_id=practice_id, response=response)
                 return response
@@ -644,7 +787,7 @@ def create_practice_router() -> APIRouter:
                 )
                 user_state = refreshed_user_state(conn, session)
                 compare_and_update(conn, session, status="finished", user_state=user_state)
-                response = {"ok": True, "session": view(conn, session), "report": report}
+                response = {"ok": True, "session": view(conn, session, request.app.state.settings), "report": report}
                 save_idempotency(conn, operation=f"finish:{practice_id}", key=body["idempotency_key"],
                                  request_hash=request_hash, practice_id=practice_id, response=response)
                 return response
@@ -692,7 +835,7 @@ def create_practice_router() -> APIRouter:
                      judgment, evidence, exit_condition, int(decision_date < session["revealed_date"]), corrects_id),
                 )
                 compare_and_update(conn, session)
-                response = {"ok": True, "session": view(conn, session)}
+                response = {"ok": True, "session": view(conn, session, request.app.state.settings)}
                 save_idempotency(conn, operation=f"decision:{practice_id}", key=body["idempotency_key"],
                                  request_hash=request_hash, practice_id=practice_id, response=response)
                 return response
@@ -709,6 +852,8 @@ def create_practice_router() -> APIRouter:
                  "low": row["low"], "close": row["close"], "volume": row["volume"]}
                 for row in version.daily_series(code, on_or_before=session["revealed_date"])
             ]
+            from app.research.exposure import capture_market_query
+            capture_market_query(request.app.state.settings, session, code, [str(item["date"]) for item in points])
             return {"code": code, "as_of": session["revealed_date"], "points": points,
                     "limitations": [] if points else ["所选版本在揭晓区间没有该证券行情"]}
 
@@ -716,7 +861,7 @@ def create_practice_router() -> APIRouter:
     def report(request: Request, practice_id: str):
         with connect(request) as conn:
             session = require_session(conn, practice_id)
-            comparison = view(conn, session)["comparison"]
+            comparison = view(conn, session, request.app.state.settings)["comparison"]
             return {"report": {"comparison": comparison, "decisions": decisions(conn, practice_id),
                                "summary": {"as_of": session["revealed_date"], "status": session["status"]},
                                "limitations": comparison.get("limitations", [])}}

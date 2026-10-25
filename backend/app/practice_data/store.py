@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from typing import Any
 
@@ -20,6 +21,7 @@ __all__ = [
     "put_refresh_request",
     "encode_json",
     "decode_json",
+    "version_content_digest",
 ]
 
 DATA_SCHEMA = (
@@ -78,6 +80,15 @@ def encode_json(value: Any) -> str:
 
 def decode_json(value: str) -> Any:
     return json.loads(value)
+
+
+def version_content_digest(conn: sqlite3.Connection, version_id: str) -> str:
+    rows = conn.execute(
+        "SELECT code,trade_date,open,high,low,close,preclose,volume,amount,adjustflag,tradestatus"
+        " FROM practice_data_daily WHERE version_id=? ORDER BY code,trade_date", (version_id,)
+    ).fetchall()
+    payload = [dict(zip(("code","trade_date","open","high","low","close","preclose","volume","amount","adjustflag","tradestatus"), row)) for row in rows]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def insert_version(conn: sqlite3.Connection, version: dict[str, Any]) -> None:

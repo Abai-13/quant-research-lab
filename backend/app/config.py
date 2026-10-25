@@ -17,6 +17,9 @@ from typing import Mapping
 
 from dotenv import dotenv_values
 
+from .credentials import CredentialTokenSource
+from .credentials.service import target_fingerprint
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 DEFAULT_BACKEND_HOST = "127.0.0.1"
@@ -77,7 +80,7 @@ class SourceSettings:
     source_code: str
     api_base_url: str
     token_present: bool
-    token: str = field(default="", repr=False)
+    token: object = field(default="", repr=False)
 
     @property
     def is_real_source(self) -> bool:
@@ -207,7 +210,7 @@ def _resolve_non_negative_int(raw: str | None, default: int, name: str) -> int:
 _TOKEN_VARIABLES = ("APP_TUSHARE_TOKEN", "TUSHARE_TOKEN", "TUSHARE_PRO_TOKEN")
 
 
-def _resolve_source_settings(source: Mapping[str, str]) -> SourceSettings:
+def _resolve_source_settings(source: Mapping[str, str], runtime_dir: Path) -> SourceSettings:
     source_code = (source.get("APP_DATA_SOURCE") or "tushare").strip()
     if source_code not in SUPPORTED_DATA_SOURCES:
         raise ConfigError(
@@ -220,11 +223,16 @@ def _resolve_source_settings(source: Mapping[str, str]) -> SourceSettings:
         if candidate:
             token = candidate
             break
+    credential = CredentialTokenSource(
+        runtime_dir,
+        target_fingerprint(api_base_url),
+        token or None,
+    ) if source_code == "tushare" else ""
     return SourceSettings(
         source_code=source_code,
         api_base_url=api_base_url,
-        token_present=bool(token),
-        token=token,
+        token_present=bool(credential) if source_code == "tushare" else False,
+        token=credential,
     )
 
 
@@ -254,7 +262,7 @@ def load_settings(values: Mapping[str, str] | None = None, project_root: Path | 
     fixture_dir = _resolve_path(
         source.get("APP_DATA_FIXTURE_DIR"), root / "backend" / "tests" / "fixtures" / "tushare", root
     )
-    data_source = _resolve_source_settings(source)
+    data_source = _resolve_source_settings(source, runtime_dir)
     import_retry = ImportRetrySettings(
         max_attempts_per_page=_resolve_positive_int(
             source.get("APP_IMPORT_MAX_ATTEMPTS"), 3, "APP_IMPORT_MAX_ATTEMPTS"

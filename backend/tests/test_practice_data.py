@@ -353,4 +353,8 @@ def test_normalize_rejects_bad_tradestatus():
 def test_router_exports_expected_subroutes():
     router = create_practice_data_router()
     paths = {route.path for route in router.routes}
-    assert paths == {"/data/sources", "/data/versions", "/data/refresh"}
+    assert paths == {
+        "/data/sources", "/data/versions", "/data/refresh",
+        "/data/presets", "/data/prepare", "/data/jobs/{job_id}",
+        "/data/jobs/{job_id}/cancel", "/data/jobs/{job_id}/resume", "/data/cache",
+    }

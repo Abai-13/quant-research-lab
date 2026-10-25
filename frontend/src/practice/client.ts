@@ -15,6 +15,8 @@ import type {
   PracticeReport,
   PracticeSummary,
   PracticeView,
+  ResearchContextAvailability,
+  ResearchSourceContext,
 } from "./types";
 
 const REASON_MESSAGES: Record<string, string> = {
@@ -588,6 +590,27 @@ export async function fetchSession(practiceId: string): Promise<PracticeView> {
   const raw = await request<unknown>(`/api/practice/sessions/${encodeURIComponent(practiceId)}`);
   const record = isRecord(raw) ? raw : {};
   return normalizeSession(record.session ?? raw);
+}
+
+export async function fetchResearchSourceContext(
+  practiceId: string,
+  expectedRevision: number,
+): Promise<ResearchContextAvailability> {
+  const raw = await request<unknown>(
+    `/api/practice/sessions/${encodeURIComponent(practiceId)}/research-context?expected_revision=${encodeURIComponent(String(expectedRevision))}`,
+  );
+  const record = isRecord(raw) ? raw : {};
+  if (record.availability === "available" && isRecord(record.source_context)) {
+    return { availability: "available", source_context: record.source_context as unknown as ResearchSourceContext };
+  }
+  if (record.availability === "supplementation_required") {
+    return {
+      availability: "supplementation_required",
+      reason: typeof record.reason === "string" ? record.reason : "historical_context_incomplete",
+      missing_fields: asArray(record.missing_fields).filter((field): field is string => typeof field === "string"),
+    };
+  }
+  throw new Error("练习研究来源上下文响应格式无效。");
 }
 
 export async function restartPractice(practiceId: string, idempotencyKey: string): Promise<PracticeView> {

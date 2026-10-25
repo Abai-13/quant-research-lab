@@ -516,16 +516,22 @@ def create_backup(
             }
         )
 
-    side_db = Path(settings.runtime_dir) / "maintenance.db"
-    side_entry = None
-    if side_db.is_file():
-        side_target = package / "maintenance.db"
-        # 侧库是持续可写 SQLite：必须用 backup API 取独立一致快照，不能硬链接。
+    # Side databases are snapshotted consistently and explicitly allowlisted.
+    # Credential storage under agent/gateway is intentionally excluded.
+    side_databases = [
+        (Path(settings.runtime_dir) / "maintenance.db", "maintenance.db"),
+        (Path(settings.runtime_dir) / "agent" / "tasks.sqlite3", "agent/tasks.sqlite3"),
+        (Path(settings.runtime_dir) / "agent" / "maintenance.sqlite3", "agent/maintenance.sqlite3"),
+    ]
+    for side_db, relative in side_databases:
+        if not side_db.is_file():
+            continue
+        side_target = package / relative
         _sqlite_snapshot(side_db, side_target)
         side_entry = {
-            "path": "maintenance.db",
+            "path": relative,
             "kind": "side_db",
-            "package_path": "maintenance.db",
+            "package_path": relative,
             "sha256": _sha256_file(side_target),
             "bytes": side_target.stat().st_size,
             "storage": "snapshot",
@@ -640,6 +646,17 @@ def verify_backup(package: Path) -> dict[str, Any]:
             shutil.copy2(source, target)
             if _sha256_file(target) != entry["sha256"]:
                 return {"verified": False, "reason": f"file_mismatch:{package_path}"}
+            if entry.get("kind") == "side_db":
+                try:
+                    check = sqlite3.connect(target)
+                    try:
+                        integrity = check.execute("PRAGMA integrity_check").fetchone()
+                        if not integrity or integrity[0] != "ok":
+                            return {"verified": False, "reason": f"side_db_integrity_failed:{package_path}"}
+                    finally:
+                        check.close()
+                except sqlite3.Error:
+                    return {"verified": False, "reason": f"side_db_unreadable:{package_path}"}
     return {
         "verified": True,
         "verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -661,6 +678,18 @@ def restore_package(package: Path, target_dir: Path) -> dict[str, Any]:
     target_db = target_dir / "app.db"
     if target_db.exists():
         raise DataError("restore_target_exists", f"目标数据库已存在，拒绝覆盖: {target_db}")
+    target_root = target_dir.resolve()
+    for entry in files:
+        package_path = str(entry.get("package_path") or "")
+        if not package_path or package_path.startswith(("/", "\\")) or ".." in Path(package_path).parts:
+            raise DataError("backup_path_escape", f"不安全的包内路径: {package_path}")
+        target = (target_root / package_path).resolve()
+        try:
+            target.relative_to(target_root)
+        except ValueError as exc:
+            raise DataError("backup_path_escape", f"恢复路径逃逸: {package_path}") from exc
+        if target.exists():
+            raise DataError("restore_target_exists", f"恢复目标已存在，拒绝覆盖: {target}")
     shutil.copy2(package / "app.db", target_db)
     restored = 0
     for entry in files:
@@ -676,9 +705,18 @@ def restore_package(package: Path, target_dir: Path) -> dict[str, Any]:
         if _sha256_file(target) != entry["sha256"]:
             raise DataError("restore_copy_mismatch", f"恢复后摘要不符: {package_path}")
         restored += 1
-    side_source = package / "maintenance.db"
-    if side_source.is_file():
-        shutil.copy2(side_source, target_dir / "maintenance.db")
+    for entry in files:
+        if entry.get("kind") != "side_db":
+            continue
+        package_path = str(entry["package_path"])
+        if package_path.startswith(("/", "\\")) or ".." in Path(package_path).parts:
+            raise DataError("backup_path_escape", f"不安全的侧库包内路径: {package_path}")
+        source = package / package_path
+        target = target_dir / package_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        if _sha256_file(target) != entry["sha256"]:
+            raise DataError("restore_copy_mismatch", f"恢复后摘要不符: {package_path}")
     return {
         "status": "restored",
         "database": str(target_db),

@@ -41,6 +41,7 @@ class AgentTaskManager:
         self.store.append_event(task_id,"task_started","Task execution started.")
         task=self.store.get(task_id)
         if not task:return
+        generation=int(task["generation"])
         try:
             gateway=self.gateway if self.gateway is not None else _service("app.agent_gateway")
             tools=self.tools if self.tools is not None else _service("app.agent_tools")
@@ -49,25 +50,23 @@ class AgentTaskManager:
             engine=AgentEngine(settings=self.settings,store=self.store,gateway=gateway,tools=tools,blocking_semaphore=self._blocking_semaphore)
             result,_,usage=await engine.run(task,context=context,cancel_event=cancel_event)
             if cancel_event.is_set(): return
-            if self.store.transition(task_id,("running",),"completed",result=result,usage=usage):
-                self.store.append_event(task_id,"task_completed","Task completed with evidence and draft references.",
-                                        evidence_ids=[str(e.get("evidence_id")) for e in result["evidence"] if isinstance(e,dict) and e.get("evidence_id")][:100])
+            self.store.commit_completion(task_id,generation,result,usage)
         except asyncio.CancelledError:
             # Cancellation endpoint atomically writes cancelled first; shutdown leaves running for restart recovery.
             return
         except RuntimeErrorCode as exc:
             reason=exc.reason[:80]
-            if self.store.transition(task_id,("running",),"failed",reason=reason):
+            if self.store.transition(task_id,("running",),"failed",reason=reason,generation=generation):
                 self.store.append_event(task_id,"task_failed","Task stopped with a bounded runtime error.",reason=reason)
         except Exception as exc:
             candidate=getattr(exc,"reason",None)
             reason=candidate if isinstance(candidate,str) and candidate in {"context_stale","practice_not_found","revision_conflict","context_invalid"} else "agent_internal_error"
             if reason=="context_stale":self.store.mark_stale(task_id)
-            if self.store.transition(task_id,("running",),"failed",reason=reason):
+            if self.store.transition(task_id,("running",),"failed",reason=reason,generation=generation):
                 self.store.append_event(task_id,"task_failed","Task stopped because its binding changed or runtime service failed.",reason=reason)
 
-    async def cancel(self, task_id: str) -> dict[str, Any] | None:
-        view=self.store.cancel(task_id)
+    async def cancel(self, task_id: str, expected_generation: int | None = None) -> dict[str, Any] | None:
+        view=self.store.cancel(task_id, expected_generation)
         if view and view["status"]=="cancelled":
             pair=self._running.get(task_id)
             if pair:

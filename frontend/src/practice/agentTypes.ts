@@ -29,6 +29,7 @@ export type AgentTask = {
   goal: string; config_version: string; context: Record<string, unknown>; created_at: string;
   updated_at: string; parent_task_id: string | null; stop_reason: string | null; usage: AgentUsage;
   result: AgentResult | null; stale: boolean;
+  operation_id?: string | null; generation?: number; resumable?: boolean;
 };
 export type AgentEvent = {
   seq: number; kind: string; created_at: string; tool_name: string | null;

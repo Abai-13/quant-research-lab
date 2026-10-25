@@ -76,20 +76,29 @@ class TushareAdapter(DataAdapter):
         self,
         *,
         api_base_url: str,
-        token: str | None,
+        token: str | Any | None,
         timeout_seconds: float = 30.0,
         min_interval_seconds: float = 0.35,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._api_base_url = api_base_url.rstrip("/")
-        self._token = token or ""
+        self._token_source = token
         self._timeout = timeout_seconds
         self._min_interval = max(0.0, min_interval_seconds)
         self._transport = transport
 
     @property
     def has_credentials(self) -> bool:
-        return bool(self._token)
+        return bool(self._token_source)
+
+    def _resolve_token(self) -> str:
+        source = self._token_source
+        if hasattr(source, "resolve") and callable(source.resolve):
+            try:
+                return source.resolve()
+            except Exception:
+                return ""
+        return source if isinstance(source, str) else ""
 
     def min_interval_seconds(self) -> float:
         return self._min_interval
@@ -97,26 +106,27 @@ class TushareAdapter(DataAdapter):
     def max_rows(self, interface: str) -> int:
         return MAX_ROWS.get(interface, 6000)
 
-    def _request_body(self, request: DataRequest) -> dict[str, Any]:
+    def _request_body(self, request: DataRequest, token: str) -> dict[str, Any]:
         params = dict(request.params)
         if request.page_no > 1:
             params.setdefault("limit", str(self.max_rows(request.interface)))
             params.setdefault("offset", str(self.max_rows(request.interface) * (request.page_no - 1)))
         return {
             "api_name": request.interface,
-            "token": self._token,
+            "token": token,
             "params": params,
             "fields": REQUEST_FIELDS.get(request.interface, ""),
         }
 
     def fetch_page(self, request: DataRequest) -> FetchOutcome:
-        if not self._token:
+        token = self._resolve_token()
+        if not token:
             return FetchOutcome(
                 request=request,
                 status="error",
                 error=CredentialsRequiredError(),
             )
-        body = self._request_body(request)
+        body = self._request_body(request, token)
         raw_bytes = json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")
         try:
             with httpx.Client(timeout=self._timeout, transport=self._transport) as client:

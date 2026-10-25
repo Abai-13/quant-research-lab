@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 import re
 import sqlite3
+import threading
+import time
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -26,7 +29,12 @@ __all__ = ["RefreshError", "perform_refresh", "validate_refresh_payload"]
 
 MAX_SYMBOLS = 20
 MAX_SPAN_DAYS = 366
+MAX_DAILY_ROWS = 20_000
+MAX_UNIT_ATTEMPTS = 3
+MAX_RETRY_WAIT_SECONDS = 60
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_BAOSTOCK_SYMBOL_RE = re.compile(r"^(?:sh|sz|bj)\.\d{6}$", re.IGNORECASE)
+_BAOSTOCK_SOURCE_LOCK = threading.Lock()
 
 PROVIDERS: dict[str, Callable[[str, str, str], list[dict[str, Any]]]] = {
     "baostock": baostock_fetch_daily,
@@ -54,7 +62,7 @@ def validate_refresh_payload(payload: dict[str, Any]) -> dict[str, Any]:
     symbols_raw = payload.get("symbols")
     if not isinstance(symbols_raw, list) or not symbols_raw:
         raise RefreshError("invalid_request", "symbols 必须是非空列表")
-    symbols = [str(item).strip() for item in symbols_raw if str(item).strip()]
+    symbols = [str(item).strip().lower() if source_code == "baostock" else str(item).strip() for item in symbols_raw if str(item).strip()]
     if not symbols:
         raise RefreshError("invalid_request", "symbols 解析后为空")
     if len(symbols) != len(set(symbols)):
@@ -64,6 +72,9 @@ def validate_refresh_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "symbols_too_many",
             f"小样本策略每次至多 {MAX_SYMBOLS} 个代码，实际 {len(symbols)} 个",
         )
+    if source_code == "baostock" and any(not _BAOSTOCK_SYMBOL_RE.fullmatch(symbol) for symbol in symbols):
+        raise RefreshError("symbol_invalid", "BaoStock 代码须为 sh|sz|bj.六位证券代码")
+    symbols.sort()
     start_date = str(payload.get("start_date", "")).strip()
     end_date = str(payload.get("end_date", "")).strip()
     for label, value in (("start_date", start_date), ("end_date", end_date)):
@@ -104,6 +115,12 @@ def request_sha256(normalized: dict[str, Any]) -> str:
 def perform_refresh(
     conn: sqlite3.Connection,
     normalized: dict[str, Any],
+    *,
+    progress_callback: Callable[[int, int], None] | None = None,
+    publish_guard: Callable[[], bool] | None = None,
+    fetcher: Callable[[str, str, str], list[dict[str, Any]]] | None = None,
+    cached_units: dict[str, list[dict[str, Any]]] | None = None,
+    checkpoint_callback: Callable[[str, list[dict[str, Any]]], None] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """执行一次显式刷新；返回 (响应载荷, 是否复用旧结果)。
 
@@ -126,31 +143,86 @@ def perform_refresh(
     limitations = list(SOURCE_COVER_LIMITATIONS[synthetic])
     rows: list[dict[str, Any]] = []
     per_symbol_rows: dict[str, int] = {}
-    fetch = PROVIDERS[source_code]
-    for symbol in normalized["symbols"]:
-        try:
-            symbol_rows = fetch(symbol, normalized["start_date"], normalized["end_date"])
-        except SourceUnavailable as exc:
-            raise RefreshError(exc.reason, exc.detail, 503) from exc
-        except SourceDataError as exc:
-            raise RefreshError(exc.reason, exc.detail) from exc
+    fetch = fetcher or PROVIDERS[source_code]
+    total_retry_wait = 0.0
+    for unit_index, symbol in enumerate(normalized["symbols"], start=1):
+        if cached_units and symbol in cached_units:
+            symbol_rows = cached_units[symbol]
+        else:
+            for attempt in range(1, MAX_UNIT_ATTEMPTS + 1):
+                try:
+                    if source_code == "baostock":
+                        with _BAOSTOCK_SOURCE_LOCK:
+                            symbol_rows = fetch(symbol, normalized["start_date"], normalized["end_date"])
+                    else:
+                        symbol_rows = fetch(symbol, normalized["start_date"], normalized["end_date"])
+                    break
+                except SourceUnavailable as exc:
+                    if attempt >= MAX_UNIT_ATTEMPTS:
+                        raise RefreshError(exc.reason, exc.detail, 503) from exc
+                    delay = float(2 ** (attempt - 1))
+                    if total_retry_wait + delay > MAX_RETRY_WAIT_SECONDS:
+                        raise RefreshError("retry_budget_exhausted", exc.detail, 503) from exc
+                    time.sleep(delay)
+                    total_retry_wait += delay
+                except SourceDataError as exc:
+                    raise RefreshError(exc.reason, exc.detail) from exc
+        if len(symbol_rows) > MAX_DAILY_ROWS - len(rows):
+            raise RefreshError("daily_rows_too_many", f"日线行数超过 {MAX_DAILY_ROWS}")
+        seen_dates: set[str] = set()
+        for row in symbol_rows:
+            try:
+                row_date = dt.date.fromisoformat(str(row["trade_date"]))
+            except (KeyError, ValueError) as exc:
+                raise RefreshError("trade_date_invalid", f"{symbol} 返回无效交易日期") from exc
+            if not normalized["start_date"] <= row_date.isoformat() <= normalized["end_date"]:
+                raise RefreshError("trade_date_out_of_range", f"{symbol} 返回范围外数据 {row_date}")
+            if row_date.isoformat() in seen_dates:
+                raise RefreshError("trade_date_duplicate", f"{symbol} 返回重复日期 {row_date}")
+            seen_dates.add(row_date.isoformat())
+            if source_code == "baostock" and row.get("adjustflag") != "3":
+                raise RefreshError("adjustment_flag_invalid", f"{symbol} {row_date} 不是不复权数据")
+            if row.get("volume") is not None and int(row["volume"]) < 0:
+                raise RefreshError("volume_invalid", f"{symbol} {row_date} 成交量为负")
+            if row.get("amount") is not None and float(row["amount"]) < 0:
+                raise RefreshError("amount_invalid", f"{symbol} {row_date} 成交额为负")
+            if row.get("tradestatus") == 0 and (
+                (row.get("volume") not in (None, 0)) or (row.get("amount") not in (None, 0))
+            ):
+                raise RefreshError("suspension_inconsistent", f"{symbol} {row_date} 停牌行成交量/额非零")
+            if row.get("tradestatus") == 1:
+                values = [row.get(key) for key in ("open", "high", "low", "close")]
+                if any(value is None or float(value) <= 0 for value in values):
+                    raise RefreshError("price_invalid", f"{symbol} {row_date} 交易日价格缺失或非正")
+                if float(row["high"]) < max(float(row["open"]), float(row["close"])) or float(row["low"]) > min(float(row["open"]), float(row["close"])):
+                    raise RefreshError("ohlc_inconsistent", f"{symbol} {row_date} OHLC 区间不一致")
         per_symbol_rows[symbol] = len(symbol_rows)
         rows.extend(symbol_rows)
+        if checkpoint_callback is not None:
+            checkpoint_callback(symbol, symbol_rows)
+        if progress_callback is not None:
+            progress_callback(unit_index, len(normalized["symbols"]))
 
     span_rows = max(per_symbol_rows.values()) if per_symbol_rows else 0
     coverage = {
         "symbols": len(normalized["symbols"]),
         "daily_rows": len(rows),
+        "content_sha256": hashlib.sha256(
+            json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
         "per_symbol_rows": per_symbol_rows,
         "date_span": normalized["start_date"] + ".." + normalized["end_date"],
         "calendar_checked": False,
+        "unit_contract": {"price": "CNY/share", "volume": "shares", "amount": "CNY", "adjustflag": "3=unadjusted"},
         "corporate_actions": "not_included",
-        "adjust_factor": "not_available_upstream",
+        "adjust_factor": "not_requested_upstream_interface_exists",
     }
     record_count = registry_count(rows)
     version_id = build_version_id(source_code, normalized, rows)
     created_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     try:
+        if publish_guard is not None and not publish_guard():
+            raise RefreshError("publication_fenced", "任务已取消或代次已变更，拒绝发布")
         store.insert_version(
             conn,
             {
@@ -202,11 +274,11 @@ def perform_refresh(
 
 SOURCE_COVER_LIMITATIONS: dict[bool, list[str]] = {
     True: [
-        "合成样本：工作日确定性序列，没有停牌、涨跌停与真实公司行为。",
+        "合成样本：工作日确定性序列，没有停牌、涨跌停、上市区间与真实公司行为。",
         "练习库共享数据版本：所有练习可复用，删除前版本不可复现的日子需新建。",
     ],
     False: [
-        "真实源：不复权日线，无独立复权因子序列；含除权除息日的价格保持原始值。",
+        "真实源：当前只取不复权日线；上游有 query_adjust_factor，但本版未接入，含除权除息日价格保持原始值。",
         "未包含收盘后公司行为处理：分红/送转/停牌交易日历校验未启用，保持受限。",
     ],
 }

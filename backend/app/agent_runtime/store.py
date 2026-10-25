@@ -6,7 +6,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +46,10 @@ class AgentStore:
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     parent_task_id TEXT, stop_reason TEXT, usage_json TEXT NOT NULL,
                     result_json TEXT, stale INTEGER NOT NULL DEFAULT 0,
-                    attempt INTEGER NOT NULL DEFAULT 1
+                    attempt INTEGER NOT NULL DEFAULT 1,
+                    generation INTEGER NOT NULL DEFAULT 1, checkpoint_json TEXT NOT NULL DEFAULT '{"sequence":0,"steps":[],"validation":"not_checked"}',
+                    resumable INTEGER NOT NULL DEFAULT 0, lease_owner TEXT, lease_until TEXT,
+                    resume_key_hash TEXT, resume_payload_hash TEXT, credential_generation TEXT
                 );
                 CREATE INDEX IF NOT EXISTS task_scope_idx ON tasks(practice_id, created_at DESC);
                 CREATE TABLE IF NOT EXISTS events (
@@ -57,10 +60,32 @@ class AgentStore:
                 );
             """)
             conn.execute("PRAGMA foreign_keys=ON")
-            rows = conn.execute("SELECT task_id FROM tasks WHERE status IN ('queued','running')").fetchall()
-            for (task_id,) in rows:
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(tasks)")}
+            for name, ddl in (("generation", "INTEGER NOT NULL DEFAULT 1"),
+                              ("checkpoint_json", "TEXT NOT NULL DEFAULT '{\"sequence\":0,\"steps\":[],\"validation\":\"not_checked\"}'"),
+                              ("resumable", "INTEGER NOT NULL DEFAULT 0"),
+                              ("lease_owner", "TEXT"), ("lease_until", "TEXT"),
+                              ("resume_key_hash", "TEXT"), ("resume_payload_hash", "TEXT"),
+                              ("credential_generation", "TEXT")):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {ddl}")
+            rows = conn.execute("SELECT task_id,checkpoint_json FROM tasks WHERE status IN ('queued','running')").fetchall()
+            for task_id, _checkpoint_json in rows:
                 now = utc_now()
-                conn.execute("UPDATE tasks SET status='interrupted',stop_reason='process_restarted',updated_at=? WHERE task_id=?", (now, task_id))
+                checkpoint = json.loads(conn.execute("SELECT checkpoint_json FROM tasks WHERE task_id=?", (task_id,)).fetchone()[0])
+                usage = json.loads(conn.execute("SELECT usage_json FROM tasks WHERE task_id=?", (task_id,)).fetchone()[0])
+                steps = checkpoint.get("steps", [])
+                # A pending external model call may have been accepted remotely;
+                # after a crash it must never be sent again automatically.
+                changed = False
+                for step in steps:
+                    if step.get("state") == "pending" and step.get("kind") == "external_model":
+                        step.update({"state": "unknown", "reason": "external_result_unknown"})
+                        changed = True
+                if changed:
+                    checkpoint["sequence"] = int(checkpoint.get("sequence", 0)) + 1
+                can_resume = not checkpoint.get("steps") and not usage.get("model_calls", 0) and not usage.get("tool_calls", 0)
+                conn.execute("UPDATE tasks SET status='interrupted',stop_reason='process_restarted',updated_at=?,generation=generation+1,checkpoint_json=?,resumable=?,lease_owner=NULL,lease_until=NULL WHERE task_id=?", (now, canonical(checkpoint), int(can_resume), task_id))
                 self._append_event(conn, task_id, "task_interrupted", "Process restarted before completion.", reason="process_restarted")
             return len(rows)
 
@@ -85,7 +110,8 @@ class AgentStore:
 
     def create(self, *, key: str, payload: dict[str, Any], practice_id: str | None, scope: str,
                goal: str, config_version: str, context: dict[str, Any], consent_digest: str,
-               limits: dict[str, Any], parent_task_id: str | None = None) -> tuple[dict[str, Any], bool]:
+               limits: dict[str, Any], parent_task_id: str | None = None,
+               credential_generation: str | int | None = None) -> tuple[dict[str, Any], bool]:
         encoded = canonical(payload)
         if len(encoded.encode("utf-8")) > MAX_JSON:
             raise ValueError("request_too_large")
@@ -105,10 +131,11 @@ class AgentStore:
                 return self._view(existing), False
             conn.execute("""INSERT INTO tasks(task_id,idempotency_key,payload_hash,practice_id,scope,status,goal,
                 config_version,context_json,context_fingerprint,consent_digest,limits_json,created_at,updated_at,
-                parent_task_id,usage_json) VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?)""",
+                parent_task_id,usage_json,credential_generation) VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?)""",
                 (task_id,key_hash,payload_hash,practice_id,scope,goal,config_version,canonical(context_public),context_fingerprint,
                  consent_digest,canonical(limits),now,now,parent_task_id,canonical({"input_tokens":None,"output_tokens":None,"total_tokens":None,
-                 "model_calls":0,"tool_calls":0,"elapsed_ms":0,"estimated_cost":None})))
+                 "model_calls":0,"tool_calls":0,"elapsed_ms":0,"estimated_cost":None}),
+                 str(credential_generation) if credential_generation is not None else None))
             self._append_event(conn,task_id,"task_started","Task queued.")
             row = conn.execute("SELECT * FROM tasks WHERE task_id=?",(task_id,)).fetchone()
             return self._view(row), True
@@ -124,11 +151,15 @@ class AgentStore:
     @staticmethod
     def _view(row: sqlite3.Row) -> dict[str, Any]:
         context = json.loads(row["context_json"])
-        return {"task_id":row["task_id"],"practice_id":row["practice_id"],"scope":row["scope"],"status":row["status"],
+        result = {"task_id":row["task_id"],"operation_id":row["task_id"],"kind":"agent_task",
+          "practice_id":row["practice_id"],"scope":row["scope"],"status":row["status"],
           "goal":row["goal"],"config_version":row["config_version"],"context":context,"created_at":row["created_at"],
           "updated_at":row["updated_at"],"parent_task_id":row["parent_task_id"],"stop_reason":row["stop_reason"],
           "usage":json.loads(row["usage_json"]),"result":json.loads(row["result_json"]) if row["result_json"] else None,
-          "stale":bool(row["stale"]),"consent_digest":row["consent_digest"],"limits":json.loads(row["limits_json"]),"attempt":row["attempt"]}
+          "stale":bool(row["stale"]),"consent_digest":row["consent_digest"],"limits":json.loads(row["limits_json"]),"attempt":row["attempt"],
+          "generation":row["generation"],"checkpoint":json.loads(row["checkpoint_json"]),"resumable":bool(row["resumable"]),
+          "credential_generation":row["credential_generation"]}
+        return result
 
     def get(self, task_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
@@ -157,7 +188,8 @@ class AgentStore:
             self._append_event(conn,task_id,kind,summary,tool_name,evidence_ids,reason)
 
     def transition(self, task_id: str, expected: tuple[str,...], status: str, *, reason: str | None = None,
-                   result: dict[str,Any] | None = None, usage: dict[str,Any] | None = None, stale: bool | None = None) -> bool:
+                   result: dict[str,Any] | None = None, usage: dict[str,Any] | None = None, stale: bool | None = None,
+                   generation: int | None = None) -> bool:
         if not expected:return False
         with self._lock,self._connect() as conn:
             fields=["status=?","stop_reason=?","updated_at=?"]; vals=[status,reason,utc_now()]
@@ -166,25 +198,159 @@ class AgentStore:
             if stale is not None: fields.append("stale=?"); vals.append(int(stale))
             placeholders=",".join("?" for _ in expected)
             vals.extend([task_id,*expected])
-            cur=conn.execute("UPDATE tasks SET "+",".join(fields)+f" WHERE task_id=? AND status IN ({placeholders})",vals)
+            where=f" WHERE task_id=? AND status IN ({placeholders})"
+            if generation is not None:where+=" AND generation=?"; vals.append(generation)
+            cur=conn.execute("UPDATE tasks SET "+",".join(fields)+where,vals)
             return cur.rowcount==1
 
-    def update_usage(self, task_id: str, usage: dict[str,Any]) -> None:
-        with self._lock,self._connect() as conn: conn.execute("UPDATE tasks SET usage_json=?,updated_at=? WHERE task_id=? AND status='running'",(canonical(usage),utc_now(),task_id))
+    def update_usage(self, task_id: str, usage: dict[str,Any], generation: int | None = None) -> None:
+        with self._lock,self._connect() as conn:
+            sql="SELECT usage_json FROM tasks WHERE task_id=? AND status='running'"
+            args: tuple[Any,...]=(task_id,)
+            if generation is not None:sql+=" AND generation=?"; args+=(generation,)
+            row=conn.execute(sql,args).fetchone()
+            if row is None:return
+            prior=json.loads(row[0])
+            prior_calls=int(prior.get("model_calls") or 0)
+            # Counts and elapsed time are cumulative across attempts. Unknown
+            # measurements remain unknown rather than being reset to zero.
+            for key in ("input_tokens","output_tokens","total_tokens","estimated_cost"):
+                if (prior_calls and prior.get(key) is None) or usage.get(key) is None:
+                    usage[key]=None
+                else:
+                    usage[key]=max(prior.get(key) or 0,usage.get(key) or 0)
+            for key in ("model_calls","tool_calls","elapsed_ms"):
+                usage[key]=max(int(prior.get(key,0)),int(usage.get(key,0)))
+            sql="UPDATE tasks SET usage_json=?,updated_at=? WHERE task_id=? AND status='running'"
+            args=(canonical(usage),utc_now(),task_id)
+            if generation is not None:sql+=" AND generation=?"; args+=(generation,)
+            conn.execute(sql,args)
+
+    def persist_elapsed(self, task_id: str, generation: int, aggregate_elapsed_ms: int,
+                        attempt_elapsed_ms: int) -> None:
+        """Persist final elapsed time when cancellation already fenced the run."""
+        with self._lock,self._connect() as conn:
+            row=conn.execute("SELECT generation,status,usage_json FROM tasks WHERE task_id=?",(task_id,)).fetchone()
+            # cancel() advances the task generation before cancelling its
+            # coroutine. Accept only that exact fenced cancellation, so a late
+            # prior attempt cannot write into a resumed generation.
+            if row is None or row["status"]!="cancelled" or int(row["generation"])!=int(generation)+1:return
+            usage=json.loads(row["usage_json"])
+            usage["elapsed_ms"]=max(int(usage.get("elapsed_ms") or 0),int(aggregate_elapsed_ms))
+            usage["attempt_elapsed_ms"]=int(attempt_elapsed_ms)
+            conn.execute("UPDATE tasks SET usage_json=?,updated_at=? WHERE task_id=? AND generation=? AND status='cancelled'",
+                         (canonical(usage),utc_now(),task_id,int(generation)+1))
+
+    def checkpoint_step(self, task_id: str, generation: int, step_id: str, state: str,
+                        *, kind: str = "local", result_digest: str | None = None) -> bool:
+        """Record a stable logical step under the task generation fence."""
+        if state not in {"pending", "committed", "unknown"} or not step_id or len(step_id)>160:
+            return False
+        with self._lock,self._connect() as conn:
+            row=conn.execute("SELECT checkpoint_json FROM tasks WHERE task_id=? AND generation=? AND status IN ('queued','running')",(task_id,generation)).fetchone()
+            if row is None:return False
+            checkpoint=json.loads(row[0]); steps=checkpoint.setdefault("steps",[])
+            prior=next((item for item in steps if item.get("step_id")==step_id),None)
+            if prior and prior.get("state")=="committed":return state=="committed"
+            if prior is None:
+                prior={"step_id":step_id,"attempt":1}; steps.append(prior)
+            prior.update({"state":state,"kind":kind})
+            if state=="committed":
+                prior["result_digest"]=result_digest or digest({"step_id":step_id,"state":"committed"})
+                prior.pop("reason",None)
+            elif state=="unknown":prior["reason"]="external_result_unknown"
+            checkpoint["sequence"]=int(checkpoint.get("sequence",0))+1
+            checkpoint["validation"]="pending"
+            cur=conn.execute("UPDATE tasks SET checkpoint_json=?,updated_at=? WHERE task_id=? AND generation=? AND status IN ('queued','running')",
+                             (canonical(checkpoint),utc_now(),task_id,generation))
+            return cur.rowcount==1
+
+    def set_checkpoint_validation(self, task_id: str, generation: int, state: str) -> bool:
+        if state not in {"valid", "invalid", "pending"}:return False
+        with self._lock,self._connect() as conn:
+            row=conn.execute("SELECT checkpoint_json FROM tasks WHERE task_id=? AND generation=? AND status IN ('queued','running')",(task_id,generation)).fetchone()
+            if row is None:return False
+            checkpoint=json.loads(row[0]); checkpoint["validation"]=state
+            checkpoint["sequence"]=int(checkpoint.get("sequence",0))+1
+            cur=conn.execute("UPDATE tasks SET checkpoint_json=?,updated_at=? WHERE task_id=? AND generation=? AND status IN ('queued','running')",
+                             (canonical(checkpoint),utc_now(),task_id,generation))
+            return cur.rowcount==1
+
+    def commit_completion(self, task_id: str, generation: int, result: dict[str,Any],
+                          usage: dict[str,Any]) -> bool:
+        """Atomically publish final task result and its valid checkpoint."""
+        with self._lock,self._connect() as conn:
+            row=conn.execute("SELECT checkpoint_json,usage_json FROM tasks WHERE task_id=? AND generation=? AND status='running'",(task_id,generation)).fetchone()
+            if row is None:return False
+            checkpoint=json.loads(row[0]); checkpoint["validation"]="valid"
+            checkpoint["sequence"]=int(checkpoint.get("sequence",0))+1
+            prior=json.loads(row[1]); prior_calls=int(prior.get("model_calls") or 0)
+            merged=dict(usage)
+            for key in ("input_tokens","output_tokens","total_tokens","estimated_cost"):
+                if (prior_calls and prior.get(key) is None) or merged.get(key) is None:
+                    merged[key]=None
+                else:
+                    merged[key]=max(prior.get(key) or 0,merged.get(key) or 0)
+            for key in ("model_calls","tool_calls","elapsed_ms"):
+                merged[key]=max(int(prior.get(key,0) or 0),int(merged.get(key,0) or 0))
+            cur=conn.execute("UPDATE tasks SET status='completed',stop_reason=NULL,result_json=?,usage_json=?,checkpoint_json=?,resumable=0,lease_owner=NULL,lease_until=NULL,updated_at=? WHERE task_id=? AND generation=? AND status='running'",
+                             (canonical(result),canonical(merged),canonical(checkpoint),utc_now(),task_id,generation))
+            if cur.rowcount!=1:return False
+            evidence_ids=[str(e.get("evidence_id")) for e in result.get("evidence",[]) if isinstance(e,dict) and e.get("evidence_id")][:100]
+            self._append_event(conn,task_id,"task_completed","Task completed with evidence and draft references.",evidence_ids=evidence_ids)
+            return True
 
     def start(self, task_id: str) -> bool:
         with self._lock,self._connect() as conn:
-            cur=conn.execute("UPDATE tasks SET status='running',updated_at=? WHERE task_id=? AND status='queued'",(utc_now(),task_id))
+            owner=uuid.uuid4().hex
+            until=(datetime.now(timezone.utc)+timedelta(seconds=150)).isoformat(timespec="milliseconds")
+            cur=conn.execute("UPDATE tasks SET status='running',lease_owner=?,lease_until=?,updated_at=? WHERE task_id=? AND status='queued'",(owner,until,utc_now(),task_id))
             return cur.rowcount==1
 
-    def cancel(self, task_id: str) -> dict[str,Any] | None:
+    def cancel(self, task_id: str, expected_generation: int | None = None) -> dict[str,Any] | None:
         with self._lock,self._connect() as conn:
             row=conn.execute("SELECT * FROM tasks WHERE task_id=?",(task_id,)).fetchone()
             if row is None: return None
-            if row["status"] in ("queued","running"):
-                cur=conn.execute("UPDATE tasks SET status='cancelled',stop_reason='user_cancelled',updated_at=? WHERE task_id=? AND status IN ('queued','running')",(utc_now(),task_id))
+            if expected_generation is not None and int(row["generation"])!=int(expected_generation):return None
+            if row["status"] in ("queued","running","interrupted"):
+                cur=conn.execute("UPDATE tasks SET status='cancelled',stop_reason='user_cancelled',generation=generation+1,resumable=0,lease_owner=NULL,lease_until=NULL,updated_at=? WHERE task_id=? AND status IN ('queued','running','interrupted')",(utc_now(),task_id))
                 if cur.rowcount==1:self._append_event(conn,task_id,"task_cancelled","Task cancelled by user.",reason="user_cancelled")
             return self._view(conn.execute("SELECT * FROM tasks WHERE task_id=?",(task_id,)).fetchone())
+
+    def claim_resume(self, task_id: str, expected_generation: int, *, idempotency_key: str,
+                     payload: dict[str,Any], owner: str | None = None,
+                     lease_seconds: int = 120) -> tuple[dict[str,Any],bool] | None:
+        """Atomically acquire the single-process resume lease and generation fence."""
+        owner=owner or uuid.uuid4().hex
+        now=datetime.now(timezone.utc); until=(now+timedelta(seconds=max(1,min(lease_seconds,300)))).isoformat(timespec="milliseconds")
+        with self._lock,self._connect() as conn:
+            row=conn.execute("SELECT * FROM tasks WHERE task_id=?",(task_id,)).fetchone()
+            if row is None:return None
+            key_hash=digest(idempotency_key); payload_hash=digest(payload)
+            if row["resume_key_hash"]:
+                if row["resume_key_hash"]!=key_hash or row["resume_payload_hash"]!=payload_hash:
+                    raise IdempotencyConflict("idempotency_conflict")
+                return self._view(row),False
+            if int(row["generation"])!=int(expected_generation) or row["status"]!="interrupted":return None
+            checkpoint=json.loads(row["checkpoint_json"])
+            usage=json.loads(row["usage_json"])
+            # Without a persisted model response and tool execution context we
+            # can resume only work interrupted before any external/local step.
+            if usage.get("model_calls",0) or usage.get("tool_calls",0) or checkpoint.get("steps"):
+                return None
+            cur=conn.execute("UPDATE tasks SET status='queued',attempt=attempt+1,generation=generation+1,lease_owner=?,lease_until=?,resumable=0,stop_reason=NULL,resume_key_hash=?,resume_payload_hash=?,updated_at=? WHERE task_id=? AND generation=? AND status='interrupted'",
+                             (owner,until,key_hash,payload_hash,utc_now(),task_id,expected_generation))
+            if cur.rowcount!=1:return None
+            self._append_event(conn,task_id,"task_resume_claimed","Resume lease acquired; cumulative budgets retained.")
+            return self._view(conn.execute("SELECT * FROM tasks WHERE task_id=?",(task_id,)).fetchone()),True
+
+    def resume_existing(self, task_id: str, *, idempotency_key: str, payload: dict[str,Any]) -> dict[str,Any] | None:
+        with self._connect() as conn:
+            row=conn.execute("SELECT * FROM tasks WHERE task_id=?",(task_id,)).fetchone()
+            if row is None or not row["resume_key_hash"]:return None
+            if row["resume_key_hash"]!=digest(idempotency_key) or row["resume_payload_hash"]!=digest(payload):
+                raise IdempotencyConflict("idempotency_conflict")
+            return self._view(row)
 
     def delete(self, task_id: str) -> bool:
         with self._lock,self._connect() as conn:

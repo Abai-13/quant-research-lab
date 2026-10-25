@@ -21,6 +21,7 @@ from ..config import load_settings
 from . import store
 from .service import RefreshError, perform_refresh, validate_refresh_payload
 from .sources import SOURCE_LIMITATIONS, source_definitions
+from . import operations
 
 __all__ = [
     "create_practice_data_router",
@@ -110,6 +111,107 @@ def create_practice_data_router() -> APIRouter:
             "limitations": SOURCE_LIMITATIONS,
         }
 
+    @router.get("/data/presets")
+    def data_presets() -> dict:
+        """可编辑的历史范围样例；只读且不连接数据源。"""
+        return {
+            "ok": True,
+            "presets": operations.PRESETS,
+            "limits": {"max_symbols": 20, "max_calendar_days": 366, "max_daily_rows": 20000,
+                       "default_timeout_seconds": 300, "hard_timeout_seconds": 900},
+        }
+
+    @router.post("/data/prepare")
+    def data_prepare(request: Request, body: dict[str, Any]):
+        """排入异步历史准备任务；真实来源失败保持失败，不换合成源。"""
+        try:
+            payload = dict(body)
+            preset_id = payload.get("preset_id")
+            if preset_id is not None:
+                preset = next((item for item in operations.PRESETS if item["preset_id"] == preset_id), None)
+                if preset is None:
+                    raise RefreshError("unknown_preset", f"未知历史范围预设 {preset_id!r}")
+                for key in ("symbols", "start_date", "end_date", "source_code"):
+                    payload.setdefault(key, preset[key])
+            payload.setdefault("source_code", "baostock")
+            refresh_mode = payload.get("refresh_mode", "use_cache")
+            refresh_mode = {"reuse_cache": "use_cache", "refresh": "force_refresh"}.get(refresh_mode, refresh_mode)
+            if refresh_mode == "synthetic" and payload.get("source_code") == "synthetic":
+                refresh_mode = "use_cache"
+            if refresh_mode not in {"use_cache", "force_refresh"}:
+                raise RefreshError("invalid_refresh_mode", "refresh_mode 须为 reuse_cache/use_cache 或 refresh/force_refresh")
+            normalized = validate_refresh_payload(payload)
+            normalized["refresh_mode"] = refresh_mode
+            timeout = int(body.get("timeout_seconds", operations.DEFAULT_TIMEOUT_SECONDS))
+        except (RefreshError, TypeError, ValueError) as exc:
+            if isinstance(exc, RefreshError):
+                return _error(exc)
+            return JSONResponse(status_code=400, content={"ok": False, "reason": "invalid_timeout", "detail": str(exc)})
+        try:
+            # Capture the selected isolated practice connection factory. The worker
+            # opens a fresh connection for each progress update and publication.
+            settings = getattr(request.app.state, "settings", None) or load_settings()
+            provider = _CONNECT_PROVIDER or _default_connect_provider()
+            conn_factory = lambda: provider(settings)
+            result = operations.submit_job(conn_factory, normalized, timeout_seconds=timeout)
+        except RefreshError as exc:
+            return _error(exc)
+        except RuntimeError as exc:
+            return _svc_error(exc)
+        return JSONResponse(status_code=202, content={"ok": True, **result})
+
+    @router.get("/data/jobs/{job_id}")
+    def data_job(request: Request, job_id: str):
+        try:
+            conn = _connect(request)
+        except RuntimeError as exc:
+            return _svc_error(exc)
+        try:
+            job = operations.get_job(conn, job_id)
+            if job is None:
+                return JSONResponse(status_code=404, content={"ok": False, "reason": "job_not_found"})
+            return {"ok": True, **job}
+        finally:
+            conn.close()
+
+    @router.post("/data/jobs/{job_id}/cancel")
+    def data_job_cancel(request: Request, job_id: str, body: dict[str, Any]):
+        try:
+            generation = int(body.get("expected_generation", body.get("generation")))
+            if not isinstance(body.get("idempotency_key"), str) or not body["idempotency_key"].strip():
+                return JSONResponse(status_code=400, content={"ok": False, "reason": "idempotency_key_required"})
+            settings = getattr(request.app.state, "settings", None) or load_settings()
+            provider = _CONNECT_PROVIDER or _default_connect_provider()
+            job = operations.cancel_job(lambda: provider(settings), job_id, generation, body["idempotency_key"].strip())
+        except (TypeError, ValueError):
+            return JSONResponse(status_code=400, content={"ok": False, "reason": "generation_required"})
+        except RefreshError as exc:
+            return _error(exc)
+        except RuntimeError as exc:
+            return _svc_error(exc)
+        if job is None:
+            return JSONResponse(status_code=409, content={"ok": False, "reason": "generation_conflict"})
+        return {"ok": True, **job}
+
+    @router.post("/data/jobs/{job_id}/resume")
+    def data_job_resume(request: Request, job_id: str, body: dict[str, Any]):
+        try:
+            generation = int(body.get("expected_generation", body.get("generation")))
+            if not isinstance(body.get("idempotency_key"), str) or not body["idempotency_key"].strip():
+                return JSONResponse(status_code=400, content={"ok": False, "reason": "idempotency_key_required"})
+            settings = getattr(request.app.state, "settings", None) or load_settings()
+            provider = _CONNECT_PROVIDER or _default_connect_provider()
+            job = operations.resume_job(lambda: provider(settings), job_id, generation, body["idempotency_key"].strip())
+        except (TypeError, ValueError):
+            return JSONResponse(status_code=400, content={"ok": False, "reason": "generation_required"})
+        except RefreshError as exc:
+            return _error(exc)
+        except RuntimeError as exc:
+            return _svc_error(exc)
+        if job is None:
+            return JSONResponse(status_code=409, content={"ok": False, "reason": "not_resumable_or_generation_conflict"})
+        return JSONResponse(status_code=202, content={"ok": True, **job})
+
     @router.get("/data/versions")
     def data_versions(request: Request, limit: int = 20, offset: int = 0):
         """只读：练习库中共享的数据版本（分页有界）。"""
@@ -137,6 +239,24 @@ def create_practice_data_router() -> APIRouter:
                 "limit": safe_limit,
                 "offset": safe_offset,
             }
+        finally:
+            conn.close()
+
+    @router.get("/data/cache")
+    def data_cache(request: Request, limit: int = 20, offset: int = 0):
+        """只读列出可复用的练习数据版本与资格限制。"""
+        try:
+            conn = _connect(request)
+        except RuntimeError as exc:
+            return _svc_error(exc)
+        try:
+            if limit < 1 or offset < 0:
+                return JSONResponse(status_code=400, content={"ok": False, "reason": "invalid_request", "detail": "limit/offset 无效"})
+            versions, total = store.list_versions(conn, min(int(limit), 100), int(offset))
+            for version in versions:
+                version["eligibility"] = "restricted_analysis" if version["synthetic"] else "blocked"
+                version["content_valid"] = bool(version["coverage"].get("content_sha256") == store.version_content_digest(conn, version["version_id"]))
+            return {"ok": True, "versions": versions, "total": total, "limit": min(int(limit),100), "offset": int(offset)}
         finally:
             conn.close()
 
