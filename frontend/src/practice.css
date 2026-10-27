@@ -5,12 +5,14 @@
   background: var(--bg);
 }
 
+/* Phase 7 shared theme contract is declared in styles.css for B/C domain CSS. */
+
 .app-nav {
   position: sticky;
   top: 0;
   z-index: 20;
   border-bottom: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.94);
+  background: color-mix(in srgb, var(--p7-surface) 94%, transparent);
   backdrop-filter: blur(8px);
 }
 
@@ -81,10 +83,14 @@
 }
 
 .app-tab-active {
-  background: #ffffff;
+  background: var(--p7-surface);
   color: var(--text);
   font-weight: 600;
   box-shadow: 0 1px 2px rgba(17, 24, 39, 0.08);
+}
+
+.app-tab[aria-current="page"] {
+  color: var(--p7-accent);
 }
 
 .app-tab:focus-visible {
@@ -117,6 +123,77 @@
   flex-direction: column;
   gap: 0;
 }
+
+.practice-start-choices {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 4px 0 10px;
+}
+
+.practice-start-choices a,
+.practice-start-choices button {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 15px 18px;
+  border: 1px solid var(--p7-border, #dce2e8);
+  border-radius: var(--p7-radius, 12px);
+  background: var(--p7-surface, #fff);
+  color: var(--p7-text, #17212b);
+  text-decoration: none;
+  box-shadow: var(--p7-shadow, 0 8px 24px rgba(23, 33, 43, 0.06));
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.practice-start-choices a:hover,
+.practice-start-choices button:hover {
+  border-color: var(--p7-accent, #205f86);
+}
+
+.practice-start-choices a:focus-visible,
+.practice-start-choices button:focus-visible {
+  outline: 2px solid var(--p7-accent, #205f86);
+  outline-offset: 2px;
+}
+
+.practice-start-choices .eyebrow { margin-bottom: 0; font-size: 11px; }
+.practice-start-choices strong { font-size: 16px; }
+.practice-start-choices a > span:last-child,
+.practice-start-choices button > span:last-child { color: var(--p7-muted, #5d6976); font-size: 13px; line-height: 1.5; }
+
+.practice-data-preparation {
+  margin: 12px 0 20px;
+  border: 1px solid var(--p7-border, #dce2e8);
+  border-radius: var(--p7-radius, 12px);
+  background: var(--p7-surface, #fff);
+}
+
+.practice-data-preparation > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 12px;
+  padding: 14px 16px;
+  color: var(--p7-text, #17212b);
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.practice-data-preparation > summary span {
+  color: var(--p7-muted, #5d6976);
+  font-size: 13px;
+  font-weight: 400;
+}
+
+.practice-data-preparation > summary:focus-visible {
+  outline: 2px solid var(--p7-accent, #205f86);
+  outline-offset: 2px;
+}
+
+.practice-data-preparation-note { margin: 0 16px 16px; }
 
 .phase6-card { background: #fff; border: 1px solid #dce4ee; border-radius: 14px; padding: 22px; margin: 22px 0; box-shadow: 0 5px 18px #18304c0a; }
 .phase6-card h2 { margin: 0 0 12px; }
@@ -433,12 +510,113 @@
   font-weight: 550;
 }
 
+.practice-agent-drawer {
+  margin: 0 0 14px;
+  border: 1px solid var(--p7-border, #dce2e8);
+  border-radius: var(--p7-radius, 12px);
+  background: var(--p7-surface, #fff);
+}
+
+.practice-agent-drawer > summary {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  padding: 12px 16px;
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.practice-agent-drawer > summary span {
+  color: var(--p7-muted, #5d6976);
+  font-size: 13px;
+  font-weight: 400;
+}
+
+.practice-agent-drawer > summary:focus-visible {
+  outline: 2px solid var(--p7-accent, #205f86);
+  outline-offset: 2px;
+}
+
+.practice-agent-drawer[open] { padding-bottom: 1px; }
+.practice-agent-drawer[open] .agent-panel { margin: 0; border: 0; box-shadow: none; }
+
 .practice-form {
   display: flex;
   flex-direction: column;
   gap: 18px;
   margin-top: 18px;
 }
+
+.practice-wizard-steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-bottom: 1px solid var(--p7-border, #dce2e8);
+}
+
+.practice-wizard-steps button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 4px 12px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--p7-muted, #5d6976);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+
+.practice-wizard-steps button span {
+  display: grid;
+  place-items: center;
+  width: 25px;
+  height: 25px;
+  flex: 0 0 auto;
+  border: 1px solid var(--p7-border, #dce2e8);
+  border-radius: 50%;
+  font-size: 13px;
+}
+
+.practice-wizard-steps button.is-current {
+  border-color: var(--p7-accent, #205f86);
+  color: var(--p7-accent, #205f86);
+  font-weight: 650;
+}
+
+.practice-wizard-steps button.is-current span,
+.practice-wizard-steps button.is-complete span {
+  border-color: var(--p7-accent, #205f86);
+  background: var(--p7-accent, #205f86);
+  color: #fff;
+}
+
+.practice-wizard-steps button:focus-visible {
+  outline: 2px solid var(--p7-accent, #205f86);
+  outline-offset: 2px;
+}
+
+.practice-review {
+  padding: 18px;
+  border: 1px solid var(--p7-border, #dce2e8);
+  border-radius: var(--p7-radius, 12px);
+  background: var(--p7-surface, #fff);
+}
+
+.practice-review h3 { margin: 0 0 14px; font-size: 17px; }
+.practice-review dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 0; }
+.practice-review dl > div { min-width: 0; padding: 10px 12px; border-radius: 8px; background: var(--soft); }
+.practice-review dt { color: var(--muted); font-size: 12px; }
+.practice-review dd { margin: 2px 0 0; font-weight: 600; overflow-wrap: anywhere; }
+.practice-review > p { margin: 14px 0 0; color: var(--muted); font-size: 13px; }
+.practice-review-positions { margin: 12px 0 0; padding-left: 20px; color: var(--muted); }
+.practice-review .practice-details { margin-bottom: 0; }
 
 .practice-form-grid {
   display: grid;
@@ -1051,6 +1229,7 @@
   color: var(--muted);
   font-size: 13px;
   line-height: 1.7;
+  overflow-wrap: anywhere;
 }
 
 .practice-restrictions li + li {
@@ -1237,5 +1416,24 @@
 
   .practice-inline-checkbox {
     align-self: flex-start;
+  }
+
+  .practice-start-choices {
+    grid-template-columns: 1fr;
+  }
+
+  .practice-wizard-steps {
+    gap: 2px;
+  }
+
+  .practice-wizard-steps button {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+    font-size: 12px;
+  }
+
+  .practice-review dl {
+    grid-template-columns: 1fr;
   }
 }

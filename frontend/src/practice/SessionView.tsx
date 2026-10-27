@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import "./practice-session.css";
 
 import type {
   MarketSeries,
@@ -71,6 +72,7 @@ export function SessionView({
   onFinish,
   onRestart,
   onAddDecision,
+  onSendResearchQuestion,
   onRetryReport,
 }: {
   session: PracticeView;
@@ -100,6 +102,7 @@ export function SessionView({
     decision_date?: string;
     key: string;
   }) => Promise<void>;
+  onSendResearchQuestion?: (question: string) => void;
   onRetryReport: () => void;
 }) {
   const [hideSystem, setHideSystem] = useState(Boolean(session.settings.hide_system_hints));
@@ -550,6 +553,7 @@ export function SessionView({
           finished={finished}
           busy={Boolean(busy)}
           onAdd={onAddDecision}
+          onSendQuestion={onSendResearchQuestion}
         />
       </section>
 

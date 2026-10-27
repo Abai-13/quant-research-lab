@@ -154,15 +154,28 @@ def create_research_router() -> APIRouter:
                 return JSONResponse(status_code=422, content={"ok": False, "reason": "evaluation_window_unavailable", "detail": "无法从冻结模拟数据版本派生默认120日评估区间"})
         conn = _connect(request)
         try:
+            # Hold SQLite's cross-connection write reservation across the replay
+            # lookup, plan insert, and durable response. A retry that arrives
+            # while the first request is running then observes its committed
+            # response instead of creating another frozen plan.
+            conn.execute("BEGIN IMMEDIATE")
             replay = idempotent_replay(conn, "create_plan", body)
             if replay is not None:
+                conn.rollback()
                 return _replay(replay)
             payload = {key: value for key, value in body.items() if key != "idempotency_key"}
-            response = {"ok": True, "plan": create_plan(conn, payload)}
-            save_idempotent_response(conn, "create_plan", body, response)
+            response = {"ok": True, "plan": create_plan(conn, payload, commit=False)}
+            save_idempotent_response(conn, "create_plan", body, response, commit=False)
+            conn.commit()
             return response
         except ResearchError as exc:
+            if conn.in_transaction:
+                conn.rollback()
             return _error(exc)
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
 

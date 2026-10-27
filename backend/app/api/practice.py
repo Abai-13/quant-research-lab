@@ -125,7 +125,11 @@ def _install_demo_seed(target: sqlite3.Connection, seeded: dict[str, Any]) -> di
         target_version = publish_data_version(
             target,
             source_code=str(seeded["source_code"]),
-            scope={"kind": "explicit_practice_synthetic_demo", "seed_version_id": data_version_id},
+            scope={
+                "kind": "explicit_practice_synthetic_demo",
+                "seed_version_id": data_version_id,
+                "simulation_rule_bundle_id": str(seeded["simulation_rule_bundle_id"]),
+            },
             categories=categories,
             rule_version=str(source_meta[1]),
             quality_summary={"synthetic": True, "limitations": ["离线合成示例，仅用于练习流程验证。"]},
@@ -183,6 +187,37 @@ def _install_demo_seed(target: sqlite3.Connection, seeded: dict[str, Any]) -> di
         }
     finally:
         source.close()
+
+
+def _explicit_demo_rule_bundle(conn: sqlite3.Connection, version_id: str, source_code: str) -> str | None:
+    """Return the bound rule only for the explicitly installed synthetic demo version."""
+    if source_code != "tushare-fixture":
+        return None
+    row = conn.execute(
+        "SELECT scope FROM data_version WHERE version_id=? AND source_code=? AND status='published'",
+        (version_id, source_code),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        scope = json.loads(str(row[0]))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(scope, dict) or scope.get("kind") != "explicit_practice_synthetic_demo":
+        return None
+    bundle_id = scope.get("simulation_rule_bundle_id")
+    if not isinstance(bundle_id, str) or not bundle_id.strip():
+        return None
+    bundle = load_rule_bundle(conn, bundle_id)
+    if (
+        bundle is None
+        or bundle.get("kind") != "parameter"
+        or bundle.get("assumption_scope") != "synthetic_simulation"
+        or not isinstance(bundle.get("content"), dict)
+        or not isinstance(bundle["content"].get("market_rules"), dict)
+    ):
+        return None
+    return bundle_id
 
 
 def create_practice_router() -> APIRouter:
@@ -346,10 +381,11 @@ def create_practice_router() -> APIRouter:
         if not isinstance(supplied, dict):
             raise PracticeError("settings_invalid", "settings 必须为 JSON 对象")
         bundles = ensure_default_bundles(conn)
+        demo_rule_bundle_id = _explicit_demo_rule_bundle(conn, version_id, source_code)
         settings = {
             "rebalance_every_n_days": 5,
             "parameter_bundle_id": bundles["parameter"],
-            "rule_bundle_id": supplied.get("rule_bundle_id", bundles["parameter"]),
+            "rule_bundle_id": supplied.get("rule_bundle_id", demo_rule_bundle_id or bundles["parameter"]),
             "fee_bundle_id": bundles["fee"],
             "hide_system_hints": False,
             "max_single_name_weight_bp": 2500,
@@ -517,7 +553,9 @@ def create_practice_router() -> APIRouter:
         seeded = ensure_demo_database(practice_settings(request.app.state.settings))
         conn = connect(request)
         try:
-            demo = _install_demo_seed(conn, seeded)
+            # Persist copied immutable rule bundles together with the installed demo version.
+            with conn:
+                demo = _install_demo_seed(conn, seeded)
             result = options(conn)
             result["defaults"].update({
                 "data_version_id": demo["version_id"],

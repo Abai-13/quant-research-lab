@@ -1,0 +1,182 @@
+.agent-panel .agent-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  min-width: 0;
+}
+
+.agent-panel .agent-empty > span,
+.agent-panel .agent-empty > strong {
+  flex: none;
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-panel .agent-empty > .practice-field {
+  display: grid;
+  flex: 0 1 auto;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+}
+
+.agent-panel .agent-empty > .practice-field > span {
+  flex: none;
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-panel .agent-empty > .practice-field textarea {
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.agent-panel .agent-empty > .agent-question-retained {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-panel .agent-empty > button {
+  align-self: flex-start;
+}
+
+.agent-panel .agent-task-detail.agent-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.agent-panel .agent-task-detail.agent-empty > span,
+.agent-panel .agent-task-detail.agent-empty > strong {
+  flex: none;
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 12px;
+}
+
+.agent-suggestions > span {
+  color: var(--p7-muted, #526174);
+  font-size: 0.9rem;
+}
+
+.agent-suggestion {
+  border: 1px solid var(--p7-border, #cbd5e1);
+  border-radius: var(--p7-radius, 999px);
+  background: var(--p7-surface, #fff);
+  color: var(--p7-text, #17212f);
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.agent-suggestion:hover,
+.agent-suggestion:focus-visible {
+  border-color: var(--p7-accent, #2267a8);
+  outline: 2px solid color-mix(in srgb, var(--p7-accent, #2267a8) 22%, transparent);
+  outline-offset: 1px;
+}
+
+.agent-suggestion:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.agent-connection-state {
+  margin: 0;
+  padding: 9px 12px;
+  border-left: 3px solid var(--p7-accent, #2267a8);
+  background: var(--p7-surface, #fff);
+  color: var(--p7-text, #17212f);
+}
+
+.agent-draft details,
+.agent-steps details,
+.agent-research-columns details,
+.credentials-settings details {
+  margin: 8px 0;
+}
+
+.agent-research-columns .phase6-list li {
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.agent-research-columns .phase6-list li > span {
+  color: var(--p7-muted, #526174);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.agent-research-columns .phase6-list button {
+  text-align: left;
+}
+
+.agent-research-summary {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.agent-research-summary section {
+  border: 1px solid var(--p7-border, #cbd5e1);
+  border-radius: var(--p7-radius, 12px);
+  background: var(--p7-surface, #fff);
+  padding: 12px;
+}
+
+.agent-research-summary h4 {
+  margin: 0 0 8px;
+}
+
+.agent-research-summary ul,
+.agent-research-attempts {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.agent-research-summary li,
+.agent-research-attempts li {
+  margin: 5px 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-research-technical {
+  overflow-wrap: anywhere;
+}
+
+.agent-research-columns .phase6-detail dl {
+  grid-template-columns: minmax(120px, 0.8fr) minmax(0, 2fr);
+}
+
+@media (max-width: 760px) {
+  .agent-suggestions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .agent-suggestion {
+    text-align: left;
+  }
+
+  .agent-research-columns .phase6-list li {
+    flex-direction: column;
+  }
+
+  .agent-research-columns .phase6-list li > span {
+    text-align: left;
+  }
+}

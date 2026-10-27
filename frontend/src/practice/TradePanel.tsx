@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 
 import type { OrderPreview, PracticeOptionSymbol, PracticeView } from "./types";
+import { isRevisionConflict } from "./client";
 import { directionLabel, formatDate, formatShares, parseShares } from "./format";
 import { Notice, ScalarFields } from "./ui";
 
@@ -86,6 +87,7 @@ export function TradePanel({
   const [draft, setDraft] = useState<TradeDraft>(EMPTY_DRAFT);
   const [preview, setPreview] = useState<OrderPreview | null>(null);
   const [previewSignature, setPreviewSignature] = useState<string | null>(null);
+  const [previewRevision, setPreviewRevision] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [previewing, setPreviewing] = useState(false);
@@ -115,6 +117,7 @@ export function TradePanel({
     setDraft((current) => ({ ...current, ...patch }));
     setPreview(null);
     setPreviewSignature(null);
+    setPreviewRevision(null);
     setError(null);
     setStatus(null);
   }
@@ -142,6 +145,7 @@ export function TradePanel({
       });
       setPreview(result);
       setPreviewSignature(signature);
+      setPreviewRevision(session.revision);
     } catch (previewError) {
       setError(previewError instanceof Error ? previewError.message : "订单预览失败，请稍后重试。");
     } finally {
@@ -159,8 +163,13 @@ export function TradePanel({
       setError(parseError instanceof Error ? parseError.message : "股数无效。");
       return;
     }
-    if (!preview || previewSignature !== signature) {
-      setError("请先预览当前订单，确认无误后再提交。");
+    if (!preview || previewSignature !== signature || previewRevision !== session.revision) {
+      setPreview(null);
+      setPreviewSignature(null);
+      setPreviewRevision(null);
+      setError(previewRevision !== null && previewRevision !== session.revision
+        ? "模拟进度已有变化，草稿已保留但原预览已失效。请重新预览并核对，再确认下单。"
+        : "请先预览当前订单，确认无误后再提交。");
       return;
     }
     if (keyRef.current?.signature !== signature) {
@@ -181,9 +190,17 @@ export function TradePanel({
       setPreview(null);
       setPreviewSignature(null);
     } catch (submitError) {
-      setError(
-        `${submitError instanceof Error ? submitError.message : "下单失败，请稍后重试。"} 网络结果不明时可直接重试，系统会复用同一请求编号，不会重复下单。`,
-      );
+      if (isRevisionConflict(submitError)) {
+        keyRef.current = null;
+        setPreview(null);
+        setPreviewSignature(null);
+        setPreviewRevision(null);
+        setError("模拟进度已有变化，订单没有按旧版本提交。草稿已保留，请重新预览并核对后再提交。");
+      } else {
+        setError(
+          `${submitError instanceof Error ? submitError.message : "下单失败，请稍后重试。"} 网络结果不明时可直接重试，系统会复用同一请求编号，不会重复下单。`,
+        );
+      }
     }
   }
 
@@ -290,7 +307,7 @@ export function TradePanel({
         </p>
       ) : null}
 
-      {preview && previewSignature === signature ? (
+      {preview && previewSignature === signature && previewRevision === session.revision ? (
         <div className="practice-preview" aria-label="订单预览">
           <h4>订单预览（不写订单）</h4>
           <ScalarFields record={previewFields} emptyText="预览没有返回可展示的数值。" />

@@ -8,7 +8,10 @@ import "./practice.css";
 type View = "practice" | "research" | "diagnostics";
 
 function readView(): View {
-  return window.location.hash === "#diagnostics" ? "diagnostics" : window.location.hash === "#research" ? "research" : "practice";
+  const route = window.location.hash.slice(1).split("/")[0];
+  if (route === "diagnostics") return "diagnostics";
+  if (route === "research" || route === "settings") return "research";
+  return "practice";
 }
 
 export default function App() {
@@ -24,10 +27,8 @@ export default function App() {
     if (next === view) {
       return;
     }
-    const url = new URL(window.location.href);
-    url.hash = next === "diagnostics" ? "diagnostics" : next === "research" ? "research" : "";
-    window.history.replaceState({}, "", url);
-    setView(next);
+    const route = next === "diagnostics" ? "#diagnostics" : next === "research" ? "#research" : "#practice";
+    if (window.location.hash !== route) window.location.hash = route;
   }
 
   return (
@@ -53,7 +54,7 @@ export default function App() {
               aria-current={view === "practice" ? "page" : undefined}
               onClick={() => switchView("practice")}
             >
-              历史模拟
+              模拟工作台
             </button>
             <button
               type="button"

@@ -9,6 +9,7 @@ export function DecisionPanel({
   finished,
   busy,
   onAdd,
+  onSendQuestion,
 }: {
   decisions: PracticeDecision[];
   finished: boolean;
@@ -20,11 +21,13 @@ export function DecisionPanel({
     decision_date?: string;
     key: string;
   }) => Promise<void>;
+  onSendQuestion?: (question: string) => void;
 }) {
   const [judgment, setJudgment] = useState("");
   const [evidence, setEvidence] = useState("");
   const [exitCondition, setExitCondition] = useState("");
   const [decisionDate, setDecisionDate] = useState("");
+  const [reviewQuestion, setReviewQuestion] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -164,6 +167,31 @@ export function DecisionPanel({
           </div>
         </form>
       )}
+      {onSendQuestion ? (
+        <div className="practice-follow-up-question">
+          <label className="practice-field">
+            <span>想进一步查证的问题（可选）</span>
+            <textarea
+              rows={2}
+              value={reviewQuestion}
+              disabled={busy}
+              placeholder="例如：这次买入条件还需要核对哪些已揭晓信息？"
+              onChange={(event) => setReviewQuestion(event.target.value)}
+            />
+          </label>
+          <button
+            type="button"
+            className="refresh-button"
+            disabled={busy || reviewQuestion.trim() === ""}
+            onClick={() => {
+              onSendQuestion(reviewQuestion.trim());
+              setStatus("问题已预填到研究输入；请核对后自行决定是否提交，不会自动请求模型或启动实验。");
+            }}
+          >
+            预填到 Agent / 研究输入
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }

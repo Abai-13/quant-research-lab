@@ -43,15 +43,18 @@ export const getResearchSourceContext = async (practiceId: string, expectedRevis
   if (result.availability === "supplementation_required" && Array.isArray(result.missing_fields)) return result;
   throw new Error("服务端来源上下文响应格式无效。");
 };
-export const getResearchRecord = async (id: string) => normalizeRecord((await request<{ record: ResearchRecord }>(`/api/research/records/${encodeURIComponent(id)}`)).record);
+export const getResearchRecord = async (id: string, visibility?: { practiceId: string; asOf: string }) => {
+  const scope = visibility ? `?practice_id=${encodeURIComponent(visibility.practiceId)}&as_of=${encodeURIComponent(visibility.asOf)}` : "";
+  return normalizeRecord((await request<{ record: ResearchRecord }>(`/api/research/records/${encodeURIComponent(id)}${scope}`)).record);
+};
 export const reviseResearchRecord = async (id: string, body: Record<string, unknown>) => normalizeRecord((await request<{ revision: ResearchRecord }>(`/api/research/records/${encodeURIComponent(id)}/revisions`, post({ ...body, idempotency_key: key() }))).revision);
 export const saveResearchRecord = async (body: Record<string, unknown>) => normalizeRecord((await request<{ record: ResearchRecord }>("/api/research/records", post({ ...body, idempotency_key: key() }))).record);
-export const createExperimentPlan = async (body: Record<string, unknown>) => (await request<{ plan: ExperimentPlan }>("/api/research/plans", post({ ...body, idempotency_key: key() }))).plan;
-export const startExperiment = async (plan_id: string, plan_revision: number) => (await request<{ operation: OperationView }>("/api/research/experiments", post({ plan_id, plan_revision, idempotency_key: key() }))).operation;
+export const createExperimentPlan = async (body: Record<string, unknown> & { idempotency_key: string }) => (await request<{ plan: ExperimentPlan }>("/api/research/plans", post(body))).plan;
+export const startExperiment = async (plan_id: string, plan_revision: number, idempotency_key: string) => (await request<{ operation: OperationView }>("/api/research/experiments", post({ plan_id, plan_revision, idempotency_key }))).operation;
 export const listExperiments = async () => request<{ experiments: OperationView[]; total?: number }>("/api/research/experiments?limit=50&offset=0");
 export const getExperiment = async (id: string) => { const result = await request<{ operation: OperationView; result?: Record<string, unknown> | null }>(`/api/research/experiments/${encodeURIComponent(id)}`); return { ...result.operation, result: result.result ?? null }; };
-export const cancelExperiment = (id: string, generation: number) => request<OperationView>(`/api/research/experiments/${encodeURIComponent(id)}/cancel`, post({ expected_generation: generation, idempotency_key: key() }));
-export const resumeExperiment = (id: string, generation: number) => request<OperationView>(`/api/research/experiments/${encodeURIComponent(id)}/resume`, post({ expected_generation: generation, idempotency_key: key() }));
+export const cancelExperiment = async (id: string, generation: number) => (await request<{ operation: OperationView }>(`/api/research/experiments/${encodeURIComponent(id)}/cancel`, post({ expected_generation: generation, idempotency_key: key() }))).operation;
+export const resumeExperiment = async (id: string, generation: number) => (await request<{ operation: OperationView }>(`/api/research/experiments/${encodeURIComponent(id)}/resume`, post({ expected_generation: generation, idempotency_key: key() }))).operation;
 
 export const listCredentials = () => request<{ credentials: CredentialPublic[] }>("/api/credentials");
 export const saveCredential = async (slot: string, body: { secret: string; provider: string; target_fingerprint: string | null; storage_mode: "persistent" | "process"; expected_generation: number; idempotency_key: string }) => (await request<{ credential: CredentialPublic }>(`/api/credentials/${encodeURIComponent(slot)}`, put(body))).credential;

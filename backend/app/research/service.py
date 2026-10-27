@@ -53,9 +53,22 @@ def reserve_idempotency(conn: sqlite3.Connection, operation: str, body: dict[str
     return None
 
 
-def save_idempotent_response(conn: sqlite3.Connection, operation: str, body: dict[str, Any], response: dict[str, Any]) -> None:
-    with conn:
+def save_idempotent_response(
+    conn: sqlite3.Connection,
+    operation: str,
+    body: dict[str, Any],
+    response: dict[str, Any],
+    *,
+    commit: bool = True,
+) -> None:
+    def save() -> None:
         conn.execute("INSERT INTO research_idempotency VALUES(?,?,?,?,?) ON CONFLICT(operation,idempotency_key) DO UPDATE SET request_sha256=excluded.request_sha256,response_json=excluded.response_json,created_at=excluded.created_at", (operation, body["idempotency_key"], digest(body), encode(response), now()))
+
+    if commit:
+        with conn:
+            save()
+    else:
+        save()
 
 
 def create_record(conn: sqlite3.Connection, body: dict[str, Any]) -> dict[str, Any]:
@@ -142,12 +155,18 @@ def validate_plan(body: dict[str, Any]) -> dict[str, Any]:
             "limitations": ["未见仅表示本应用尚未将这些评估曝光用于选参；不表示人或模型从未见过行情。"]}
 
 
-def create_plan(conn: sqlite3.Connection, body: dict[str, Any]) -> dict[str, Any]:
+def create_plan(conn: sqlite3.Connection, body: dict[str, Any], *, commit: bool = True) -> dict[str, Any]:
     plan = validate_plan(body)
     plan_id, timestamp = "plan_" + uuid.uuid4().hex, now()
     plan_hash = digest(plan)
-    with conn:
+    def insert() -> None:
         conn.execute("INSERT INTO research_plan VALUES(?,?,?,?,?,?)", (plan_id, 1, "frozen", encode(plan), plan_hash, timestamp))
+
+    if commit:
+        with conn:
+            insert()
+    else:
+        insert()
     return {"plan_id": plan_id, "plan_revision": 1, "status": "frozen", **plan, "plan_digest": plan_hash, "created_at": timestamp}
 
 

@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import hashlib
 import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from datetime import timedelta
 
@@ -149,6 +151,67 @@ def test_plan_bounds_and_candidate_whitelist():
             pass
         else:
             raise AssertionError("invalid plan was accepted")
+
+
+def test_frozen_plan_idempotency_is_atomic_across_sqlite_connections(temp_settings):
+    app = FastAPI()
+    app.state.settings = temp_settings
+    app.include_router(create_research_router())
+    body = {"idempotency_key": "plan-concurrent-retry", **_plan()}
+    start = threading.Barrier(3)
+
+    with TestClient(app) as client:
+        def post_plan():
+            start.wait(timeout=5)
+            return client.post("/api/research/plans", json=body)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            requests = [pool.submit(post_plan) for _ in range(2)]
+            start.wait(timeout=5)
+            responses = [request.result(timeout=10) for request in requests]
+
+        assert [response.status_code for response in responses] == [200, 200]
+        plans = [response.json()["plan"] for response in responses]
+        assert plans[0]["plan_id"] == plans[1]["plan_id"]
+
+        conflict = client.post(
+            "/api/research/plans",
+            json={**body, "candidates": [20]},
+        )
+        assert conflict.status_code == 409
+
+    with research_connect(temp_settings) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM research_plan").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM research_idempotency WHERE operation='create_plan'").fetchone()[0] == 1
+
+
+def test_failed_frozen_plan_response_write_rolls_back_for_retry(temp_settings):
+    app = FastAPI()
+    app.state.settings = temp_settings
+    app.include_router(create_research_router())
+    body = {"idempotency_key": "plan-retry-after-failure", **_plan()}
+
+    with research_connect(temp_settings) as conn:
+        conn.execute(
+            "CREATE TRIGGER reject_plan_idempotency BEFORE INSERT ON research_idempotency "
+            "WHEN NEW.operation='create_plan' BEGIN SELECT RAISE(ABORT, 'forced test failure'); END"
+        )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        failed = client.post("/api/research/plans", json=body)
+        assert failed.status_code == 500
+
+        with research_connect(temp_settings) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM research_plan").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM research_idempotency WHERE operation='create_plan'").fetchone()[0] == 0
+            conn.execute("DROP TRIGGER reject_plan_idempotency")
+
+        retried = client.post("/api/research/plans", json=body)
+        assert retried.status_code == 200, retried.text
+
+    with research_connect(temp_settings) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM research_plan").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM research_idempotency WHERE operation='create_plan'").fetchone()[0] == 1
 
 
 def test_exposure_assessment_ignores_version_and_marks_unknown(temp_settings):

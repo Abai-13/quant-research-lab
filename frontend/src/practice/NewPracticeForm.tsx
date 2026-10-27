@@ -40,7 +40,7 @@ function versionOptionLabel(
 ): string {
   const parts: string[] = [];
   if (version.synthetic) {
-    parts.push("合成示例");
+    parts.push("合成数据，资格以服务端为准");
   }
   if (version.start_date || version.end_date) {
     parts.push(`${formatDate(version.start_date)} ~ ${formatDate(version.end_date)}`);
@@ -150,7 +150,9 @@ export function NewPracticeForm({
   const [hideSystemHints, setHideSystemHints] = useState(false);
   const [positions, setPositions] = useState<PositionDraft[]>([]);
   const [formError, setFormError] = useState<string | null>(null);
+  const [step, setStep] = useState<1 | 2 | 3>(1);
   const keyRef = useRef<{ key: string; signature: string } | null>(null);
+  const submitInFlightRef = useRef(false);
 
   useEffect(() => {
     if (!options) {
@@ -230,6 +232,7 @@ export function NewPracticeForm({
   }, [setupDraft]);
 
   const selectedVersion = options?.versions.find((version) => version.version_id === versionId) ?? null;
+  const reviewSourceCode = sourceCode || selectedVersion?.source_code || options?.sources[0]?.code || "";
 
   function updatePosition(id: string, patch: Partial<PositionDraft>) {
     setPositions((current) =>
@@ -245,8 +248,10 @@ export function NewPracticeForm({
     }
   }
 
-  async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function handleSubmit() {
+    if (step !== 3 || creating || submitInFlightRef.current) {
+      return;
+    }
     setFormError(null);
     if (!options) {
       setFormError("数据来源与版本仍在读取，请稍后再试。");
@@ -355,15 +360,51 @@ export function NewPracticeForm({
     }
     payload.idempotency_key = keyRef.current.key;
 
+    submitInFlightRef.current = true;
     try {
       await onCreate(payload);
       keyRef.current = null;
     } catch {
       // 失败时保留幂等键，用户重试同一份内容不会创建重复会话。
+    } finally {
+      submitInFlightRef.current = false;
     }
   }
 
   const ready = Boolean(options) && !creating && (options?.versions.length ?? 0) > 0;
+
+  function continueTo(next: 1 | 2 | 3) {
+    setFormError(null);
+    if (next > step && step === 1) {
+      if (!options || !versionId) {
+        setFormError("请选择一个服务端提供的数据版本后继续。");
+        return;
+      }
+      const start = toApiDate(startDate);
+      const end = toApiDate(endDate);
+      if (!start || !end || start > end) {
+        setFormError("请检查开始和结束日期；结束日期不能早于开始日期。");
+        return;
+      }
+    }
+    if (next > step && step === 2) {
+      try {
+        if (parseYuanToCents(cash) === null) throw new Error("请填写起始现金（元）。");
+        for (const [index, position] of positions.entries()) {
+          parseShares(position.shares);
+          if (position.cost.trim()) parseYuanToCents(position.cost, true);
+          if (position.sellable.trim()) parseShares(position.sellable, true);
+          if (!/^[0-9]{6}\.(SZ|SH|BJ)$/.test(position.code.trim().toUpperCase())) {
+            throw new Error(`请为第 ${index + 1} 笔持仓选择有效证券代码。`);
+          }
+        }
+      } catch (error) {
+        setFormError(error instanceof Error ? error.message : "请检查本金与持仓输入。");
+        return;
+      }
+    }
+    setStep(next);
+  }
 
   return (
     <section className="section practice-card-section" aria-labelledby="new-practice-heading">
@@ -382,7 +423,7 @@ export function NewPracticeForm({
             disabled={demoBusy || !options?.demo_available}
             title={options?.demo_available === false ? "当前没有可用的合成示例数据" : undefined}
           >
-            {demoBusy ? "准备中…" : "准备合成示例"}
+            {demoBusy ? "准备中…" : "准备内置演示"}
           </button>
         </div>
 
@@ -392,15 +433,15 @@ export function NewPracticeForm({
           </Notice>
         ) : options.versions.length === 0 ? (
           <Notice tone="warn" title="暂无可选数据版本">
-            请先在“运行与诊断”中检查数据状态，或点击“准备合成示例”生成离线示例；没有数据版本时不能创建模拟。
+            当前没有可选数据版本。可准备内置演示，或展开下方历史数据准备区查看受支持的数据范围。
           </Notice>
         ) : null}
 
         {demo ? (
-          <Notice tone="warn" title="合成示例数据已准备">
+          <Notice tone="warn" title="内置合成模拟演示已准备">
             <p>
-              示例区间 {formatDate(demo.startDate)} ~ {formatDate(demo.endDate)}，仅用于离线体验，
-              数据会明确标注为合成。它不会自动创建模拟，点击下方“创建模拟”后才开始。
+              示例区间 {formatDate(demo.startDate)} ~ {formatDate(demo.endDate)}。这是内置模拟演示使用的合成行情；
+              成交资格仍由所选版本和服务端规则决定。准备完成不会创建模拟，只有第三步确认后才会创建。
             </p>
             {demo.limitations.length > 0 ? (
               <ul className="practice-restrictions">
@@ -423,8 +464,33 @@ export function NewPracticeForm({
           </details>
         ) : null}
 
-        <form className="practice-form" onSubmit={(event) => void handleSubmit(event)}>
-          <div className="practice-form-grid">
+        <form
+          className="practice-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            setFormError(step === 3 ? "请点击“确认并创建模拟”按钮提交。" : "请使用“继续”完成当前步骤；前两步不会创建模拟。");
+          }}
+        >
+          <ol className="practice-wizard-steps" aria-label="创建步骤">
+            {(["数据与区间", "本金与持仓", "确认摘要"] as const).map((label, index) => {
+              const stepNumber = (index + 1) as 1 | 2 | 3;
+              return (
+                <li key={label}>
+                  <button
+                    type="button"
+                    className={step === stepNumber ? "is-current" : step > stepNumber ? "is-complete" : ""}
+                    aria-current={step === stepNumber ? "step" : undefined}
+                    disabled={stepNumber > step + 1}
+                    onClick={() => continueTo(stepNumber)}
+                  >
+                    <span>{stepNumber}</span>{label}
+                  </button>
+                </li>
+              );
+            })}
+          </ol>
+
+          {step === 1 ? <div className="practice-form-grid">
             <label className="practice-field">
               <span>模拟名称</span>
               <input
@@ -469,6 +535,10 @@ export function NewPracticeForm({
                 onChange={(event) => setEndDate(event.target.value)}
               />
             </label>
+          </div> : null}
+
+          {step === 2 ? <>
+          <div className="practice-form-grid">
             <label className="practice-field">
               <span>起始现金（元）</span>
               <input
@@ -557,18 +627,55 @@ export function NewPracticeForm({
               </div>
             )}
           </div>
+          </> : null}
 
-          <p className="practice-field-hint">
-            系统路径默认每 5 个已揭晓交易日检查一次，并受个股权重上限与现金保留约束；这些默认值来自服务端规则组合，不会在模拟中途静默修改。
-          </p>
+          {step === 3 ? (
+            <section className="practice-review" aria-labelledby="practice-review-heading">
+              <h3 id="practice-review-heading">检查模拟设置</h3>
+              <dl>
+                <div><dt>模拟名称</dt><dd>{name.trim() || "未填写"}</dd></div>
+                <div><dt>数据模式</dt><dd>{selectedVersion?.synthetic ? "合成示例" : "历史数据"}</dd></div>
+                <div><dt>来源</dt><dd>{options?.sources.find((source) => source.code === reviewSourceCode)?.label || reviewSourceCode || "服务端数据来源"}</dd></div>
+                <div><dt>模拟区间</dt><dd>{formatDate(startDate)} 至 {formatDate(endDate)}</dd></div>
+                <div><dt>起始现金</dt><dd>{cash || "未填写"} 元</dd></div>
+                <div><dt>期初持仓</dt><dd>{positions.length ? `${positions.length} 笔` : "空仓起点"}</dd></div>
+              </dl>
+              {positions.length ? <ul className="practice-review-positions">{positions.map((position, index) => <li key={position.id}>持仓 {index + 1}：{position.query || position.code || "待选证券"}，{position.shares || "未填股数"} 股</li>)}</ul> : null}
+              <p>金额以元填写并按分保存；创建后只会揭晓到已选区间内的日期。所有价格与资格由所选数据版本决定。</p>
+              <details className="practice-details">
+                <summary>高级规则说明</summary>
+                <p className="practice-field-hint">系统路径默认每 5 个已揭晓交易日检查一次，并受个股权重上限与现金保留约束；默认值来自服务端规则组合。</p>
+                <p className="practice-field-hint">内部数据版本：{versionId || "尚未选择"}</p>
+              </details>
+            </section>
+          ) : null}
 
           {formError ? <Notice tone="error">{formError}</Notice> : null}
 
           <div className="practice-form-actions">
-            <button type="submit" className="practice-primary" disabled={!ready || !versionId}>
-              {creating ? "创建中…" : "创建模拟"}
-            </button>
-            <span className="muted">创建后可在首页继续或重开；刷新页面会从服务端恢复进度。</span>
+            {step > 1 ? <button type="button" className="refresh-button" disabled={creating} onClick={() => continueTo((step - 1) as 1 | 2 | 3)}>上一步</button> : null}
+            {step < 3 ? (
+              <button
+                key="wizard-next"
+                type="button"
+                className="practice-primary"
+                disabled={!ready}
+                onClick={() => continueTo((step + 1) as 1 | 2 | 3)}
+              >
+                继续
+              </button>
+            ) : (
+              <button
+                key="wizard-confirm-create"
+                type="button"
+                className="practice-primary"
+                disabled={!ready || !versionId || creating}
+                onClick={() => void handleSubmit()}
+              >
+                {creating ? "创建中…" : "确认并创建模拟"}
+              </button>
+            )}
+            <span className="muted">草稿保留在本页；确认创建后才会生成新模拟。</span>
           </div>
         </form>
       </div>

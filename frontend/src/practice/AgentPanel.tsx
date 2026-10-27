@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import type { AgentConfigResponse, AgentDisclosure, AgentDraft, AgentEvent, AgentLimits, AgentTask } from "./agentTypes";
 import { cancelAgentTask, createAgentTask, deleteAgentTask, getAgentConfig, getAgentEvents, getAgentTask, getAgentTasks, getDisclosure, resumeAgentTask, saveAgentConfig, testAgentConfig } from "./agentClient";
@@ -6,6 +6,7 @@ import type { PracticeView, OrderPreview } from "./types";
 import { fetchSession, placeOrder, previewOrder } from "./client";
 import { formatBps, formatCents, formatDateShort, formatShares, isRunning } from "./format";
 import { Notice } from "./ui";
+import "../agent-research.css";
 
 const DEFAULT_LIMITS: AgentLimits = { rounds: 8, tool_calls: 20, timeout_seconds: 120, tokens: 4096 };
 const HARD_LIMITS: AgentLimits = { rounds: 8, tool_calls: 20, timeout_seconds: 120, tokens: 8192 };
@@ -28,9 +29,10 @@ function evidenceValue(key: string, value: unknown) {
 function newKey() { return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`; }
 function isTradePayload(value: Record<string, unknown>) { return typeof value.ts_code === "string" && (value.direction === "buy" || value.direction === "sell") && Number.isInteger(value.planned_shares); }
 
-export function AgentPanel({ session = null, onPracticeRefresh, onSetupDraft }: { session?: SessionContext | null; onPracticeRefresh?: () => void; onSetupDraft?: (payload: Record<string, unknown>) => void }) {
+export function AgentPanel({ session = null, onPracticeRefresh, onSetupDraft, goalDraft = null }: { session?: SessionContext | null; onPracticeRefresh?: () => void; onSetupDraft?: (payload: Record<string, unknown>) => void; goalDraft?: { text: string; requestId: string } | null }) {
   const practiceId = session?.practice_id ?? null;
   const scope = practiceId ? "simulation" : "setup";
+  const sessionContextKey = session ? [session.practice_id, session.revision, session.revealed_date ?? "", session.source.version_id ?? ""].join(":") : "setup";
   const [configState, setConfigState] = useState<AgentConfigResponse | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -39,14 +41,18 @@ export function AgentPanel({ session = null, onPracticeRefresh, onSetupDraft }: 
   const [apiKey, setApiKey] = useState("");
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
+  const [connectionCheck, setConnectionCheck] = useState<{ configVersion: string; label: string } | null>(null);
   const [taskList, setTaskList] = useState<AgentTask[]>([]);
   const [selected, setSelected] = useState<AgentTask | null>(null);
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [nextSeq, setNextSeq] = useState(0);
   const [listError, setListError] = useState<string | null>(null);
   const [goal, setGoal] = useState("");
+  const goalRef = useRef(goal);
+  const [preservedGoal, setPreservedGoal] = useState<{ requestId: string; text: string } | null>(null);
   const [requestLimits, setRequestLimits] = useState<AgentLimits>(DEFAULT_LIMITS);
   const [disclosure, setDisclosure] = useState<AgentDisclosure | null>(null);
+  const [disclosureContextKey, setDisclosureContextKey] = useState<string | null>(null);
   const [resumeDisclosure, setResumeDisclosure] = useState<AgentDisclosure | null>(null);
   const [resumeConsented, setResumeConsented] = useState(false);
   const [consented, setConsented] = useState(false);
@@ -56,6 +62,49 @@ export function AgentPanel({ session = null, onPracticeRefresh, onSetupDraft }: 
   const inFlight = useRef(false);
   const cancelKeys = useRef(new Map<string, string>());
   const submissionIntent = useRef<{ signature: string; key: string } | null>(null);
+  const handledGoalRequest = useRef<string | null>(null);
+  const disclosureRequestSeq = useRef(0);
+  const taskListRequestSeq = useRef(0);
+  const taskSelectionSeq = useRef(0);
+  const selectedTaskId = useRef<string | null>(null);
+  const taskScopeRef = useRef(practiceId);
+  const sessionContextKeyRef = useRef(sessionContextKey);
+  useLayoutEffect(() => { sessionContextKeyRef.current = sessionContextKey; }, [sessionContextKey]);
+  useLayoutEffect(() => {
+    taskScopeRef.current = practiceId;
+    taskListRequestSeq.current += 1;
+    taskSelectionSeq.current += 1;
+    selectedTaskId.current = null;
+  }, [practiceId]);
+  goalRef.current = goal;
+
+  function updateGoal(value: string) {
+    goalRef.current = value;
+    setGoal(value);
+  }
+
+  useEffect(() => {
+    if (!goalDraft?.requestId || handledGoalRequest.current === goalDraft.requestId) return;
+    handledGoalRequest.current = goalDraft.requestId;
+    disclosureRequestSeq.current += 1;
+    updateGoal(goalDraft.text);
+    setPreservedGoal({ requestId: goalDraft.requestId, text: goalDraft.text });
+    setDisclosure(null);
+    setDisclosureContextKey(null);
+    setConsented(false);
+    setBusy(current => current === "disclosure" ? null : current);
+    setPanelError(null);
+    submissionIntent.current = null;
+  }, [goalDraft?.requestId]);
+
+  useEffect(() => {
+    disclosureRequestSeq.current += 1;
+    setDisclosure(null);
+    setDisclosureContextKey(null);
+    setConsented(false);
+    setBusy(current => current === "disclosure" ? null : current);
+    submissionIntent.current = null;
+  }, [sessionContextKey]);
 
   const refreshConfig = useCallback(async () => {
     try {
@@ -66,82 +115,124 @@ export function AgentPanel({ session = null, onPracticeRefresh, onSetupDraft }: 
     } catch (error) { setConfigError(error instanceof Error ? error.message : "读取模型配置失败。"); }
   }, []);
   const refreshTasks = useCallback(async () => {
-    try { const result = await getAgentTasks(practiceId); setTaskList(result.tasks); setListError(null); }
-    catch (error) { setListError(error instanceof Error ? error.message : "读取任务历史失败。"); }
+    const requestSeq = ++taskListRequestSeq.current;
+    try {
+      const result = await getAgentTasks(practiceId);
+      if (requestSeq === taskListRequestSeq.current && taskScopeRef.current === practiceId) { setTaskList(result.tasks); setListError(null); }
+    } catch (error) {
+      if (requestSeq === taskListRequestSeq.current && taskScopeRef.current === practiceId) setListError(error instanceof Error ? error.message : "读取任务历史失败。");
+    }
   }, [practiceId]);
   useEffect(() => { void refreshConfig(); }, [refreshConfig]);
-  useEffect(() => { setSelected(null); setEvents([]); setNextSeq(0); setDisclosure(null); setConsented(false); setTradeReview(null); void refreshTasks(); }, [refreshTasks]);
+  useEffect(() => { selectTask(null); setTaskList([]); setDisclosure(null); setConsented(false); void refreshTasks(); }, [refreshTasks]);
 
   useEffect(() => {
     if (!selected || !ACTIVE.has(selected.status)) return;
+    const selectionSeq = taskSelectionSeq.current;
+    const selectedScope = taskScopeRef.current;
     let live = true;
     const timer = window.setInterval(() => {
       void (async () => {
         try {
           const [task, eventPage] = await Promise.all([getAgentTask(selected.task_id), getAgentEvents(selected.task_id, nextSeq)]);
-          if (!live) return;
+          if (!live || !isCurrentTask(selectionSeq, selected.task_id, selectedScope)) return;
           setSelected(task);
           setTaskList(current => current.map(item => item.task_id === task.task_id ? task : item));
-          if (eventPage.events.length) setEvents(current => {
-            const seen = new Set(current.map(item => item.seq));
-            return [...current, ...eventPage.events.filter(item => !seen.has(item.seq))].sort((a, b) => a.seq - b.seq);
-          });
-          setNextSeq(eventPage.next_seq);
+          appendEventPage(eventPage);
           if (!ACTIVE.has(task.status)) void refreshTasks();
-        } catch (error) { if (live) setPanelError(error instanceof Error ? error.message : "任务状态读取暂不可用。"); }
+        } catch (error) { if (live && isCurrentTask(selectionSeq, selected.task_id, selectedScope)) setPanelError(error instanceof Error ? error.message : "任务状态读取暂不可用。"); }
       })();
     }, 1800);
     return () => { live = false; window.clearInterval(timer); };
   }, [selected?.task_id, selected?.status, nextSeq, refreshTasks]);
 
   const activeTask = useMemo(() => taskList.find(item => ACTIVE.has(item.status)) ?? null, [taskList]);
-  function openTask(task: AgentTask) { setSelected(task); setEvents([]); setNextSeq(0); void (async () => { try { const page = await getAgentEvents(task.task_id, 0); setEvents(page.events); setNextSeq(page.next_seq); } catch { /* task result remains readable */ } })(); }
+  function selectTask(task: AgentTask | null) {
+    taskSelectionSeq.current += 1;
+    selectedTaskId.current = task?.task_id ?? null;
+    setSelected(task); setEvents([]); setNextSeq(0); setResumeDisclosure(null); setResumeConsented(false); setTradeReview(null); setPanelError(null);
+  }
+  function isCurrentTask(selectionSeq: number, taskId: string, selectedScope: string | null) {
+    return selectionSeq === taskSelectionSeq.current && selectedTaskId.current === taskId && taskScopeRef.current === selectedScope;
+  }
+  function appendEventPage(page: { events: AgentEvent[]; next_seq: number }) {
+    setEvents(current => {
+      const seen = new Set(current.map(item => item.seq));
+      return [...current, ...page.events.filter(item => !seen.has(item.seq))].sort((a, b) => a.seq - b.seq);
+    });
+    setNextSeq(current => Math.max(current, page.next_seq));
+  }
+  function openTask(task: AgentTask) {
+    selectTask(task);
+    const selectionSeq = taskSelectionSeq.current;
+    const selectedScope = taskScopeRef.current;
+    void (async () => {
+      try { const page = await getAgentEvents(task.task_id, 0); if (isCurrentTask(selectionSeq, task.task_id, selectedScope)) appendEventPage(page); }
+      catch { /* task result remains readable */ }
+    })();
+  }
   function cancelKeyFor(taskId: string) { let key = cancelKeys.current.get(taskId); if (!key) { key = newKey(); cancelKeys.current.set(taskId, key); } return key; }
 
   async function persistConfig(event: React.FormEvent) {
     event.preventDefault(); setSettingsBusy(true); setSettingsMessage(null); setConfigError(null);
     try {
       const body: Record<string, unknown> = { ...draftConfig, limits, ...(apiKey ? { api_key: apiKey } : {}), ...(configState?.config?.config_version ? { expected_config_version: configState.config.config_version } : {}) };
-      const saved = await saveAgentConfig(body); setConfigState(saved); setSettingsMessage("配置已保存。已有任务继续使用原配置版本。");
+      const saved = await saveAgentConfig(body); setConfigState(saved); setConnectionCheck(null); setSettingsMessage("配置已保存；保存状态不代表服务已验证。已有任务继续使用原配置版本。");
+      disclosureRequestSeq.current += 1; setDisclosure(null); setDisclosureContextKey(null); setConsented(false); setResumeDisclosure(null); setResumeConsented(false);
       setLimits({ ...DEFAULT_LIMITS, ...(saved.config?.limits ?? saved.limits) });
     } catch (error) { setConfigError(error instanceof Error ? error.message : "保存配置失败。"); }
     finally { setApiKey(""); setSettingsBusy(false); }
   }
   async function runConnectionTest() {
     if (!configState?.config || !window.confirm("连接检测会向已配置服务发送一次最小工具能力请求，可能产生费用。继续吗？")) return;
-    setSettingsBusy(true); setSettingsMessage(null);
-    try { const result = await testAgentConfig(configState.config.config_version); setSettingsMessage(`连通性：${result.reachable ? "可达" : "不可达"}；工具调用：${result.tool_supported ? "支持" : "未确认/不支持"}${result.reason ? `；原因：${result.reason}` : ""}`); }
-    catch (error) { setConfigError(error instanceof Error ? error.message : "连接检测失败。"); }
+    const configVersion = configState.config.config_version;
+    setSettingsBusy(true); setSettingsMessage(null); setConnectionCheck({ configVersion, label: "正在检测…" });
+    try { const result = await testAgentConfig(configVersion); setConnectionCheck({ configVersion, label: `最近检测：${result.reachable ? "服务可达" : "服务不可达"}；工具调用：${result.tool_supported ? "支持" : "未确认/不支持"}${result.reason ? `；原因：${result.reason}` : ""}` }); }
+    catch (error) { const detail = error instanceof Error ? error.message : "连接检测失败。"; setConnectionCheck({ configVersion, label: `最近检测失败：${detail}` }); setConfigError(detail); }
     finally { setSettingsBusy(false); }
   }
   async function loadDisclosure() {
     if (!configState?.configured || activeTask) return;
+    const requestSeq = ++disclosureRequestSeq.current;
+    const requestedContextKey = sessionContextKey;
+    const requestedPracticeId = practiceId;
+    const requestedRevision = session?.revision ?? null;
     setBusy("disclosure"); setPanelError(null); setDisclosure(null); setConsented(false);
-    try { const next = await getDisclosure(practiceId, session?.revision ?? null); setDisclosure(next); setRequestLimits({ ...next.limits }); }
-    catch (error) { setPanelError(error instanceof Error ? error.message : "数据披露摘要获取失败。"); }
-    finally { setBusy(null); }
+    setDisclosureContextKey(null);
+    try {
+      const next = await getDisclosure(requestedPracticeId, requestedRevision);
+      if (requestSeq === disclosureRequestSeq.current && sessionContextKeyRef.current === requestedContextKey) { setDisclosure(next); setDisclosureContextKey(requestedContextKey); setRequestLimits({ ...next.limits }); }
+    } catch (error) { if (requestSeq === disclosureRequestSeq.current && sessionContextKeyRef.current === requestedContextKey) setPanelError(error instanceof Error ? error.message : "数据披露摘要获取失败。"); }
+    finally { if (requestSeq === disclosureRequestSeq.current) setBusy(null); }
   }
   async function loadResumeDisclosure(task: AgentTask) {
-    if (!task.resumable || !task.practice_id) return;
+    if (!task.resumable) return;
+    const selectionSeq = taskSelectionSeq.current;
+    const selectedScope = taskScopeRef.current;
     setBusy("resume-disclosure"); setPanelError(null); setResumeDisclosure(null); setResumeConsented(false);
     const taskRevision = typeof task.context.revision === "number" ? task.context.revision : null;
-    try { const next = await getDisclosure(task.practice_id, taskRevision); setResumeDisclosure(next); }
-    catch (error) { setPanelError(error instanceof Error ? error.message : "恢复披露摘要获取失败。"); }
+    try { const next = await getDisclosure(task.practice_id, taskRevision); if (isCurrentTask(selectionSeq, task.task_id, selectedScope)) setResumeDisclosure(next); }
+    catch (error) { if (isCurrentTask(selectionSeq, task.task_id, selectedScope)) setPanelError(error instanceof Error ? error.message : "恢复披露摘要获取失败。"); }
     finally { setBusy(null); }
   }
   async function submitResume(task: AgentTask) {
     if (!task.resumable || !task.operation_id || task.generation === undefined || !resumeDisclosure || !resumeConsented || inFlight.current) return;
+    const selectionSeq = taskSelectionSeq.current;
+    const selectedScope = taskScopeRef.current;
     inFlight.current = true; setBusy("resume"); setPanelError(null);
-    try { const resumed = await resumeAgentTask(task.operation_id, { consent: true, expected_generation: task.generation, config_version: resumeDisclosure.config_version, consent_digest: resumeDisclosure.consent_digest, idempotency_key: newKey() }); setSelected(resumed); setResumeDisclosure(null); setResumeConsented(false); setEvents([]); setNextSeq(0); await refreshTasks(); }
-    catch (error) { setPanelError(error instanceof Error ? error.message : "恢复任务失败；请重新读取状态与披露摘要。"); }
+    try { const resumed = await resumeAgentTask(task.operation_id, { consent: true, expected_generation: task.generation, config_version: resumeDisclosure.config_version, consent_digest: resumeDisclosure.consent_digest, idempotency_key: newKey() }); if (isCurrentTask(selectionSeq, task.task_id, selectedScope)) openTask(resumed); await refreshTasks(); }
+    catch (error) { if (isCurrentTask(selectionSeq, task.task_id, selectedScope)) setPanelError(error instanceof Error ? error.message : "恢复任务失败；请重新读取状态与披露摘要。"); }
     finally { inFlight.current = false; setBusy(null); }
   }
   async function submitGoal(event: React.FormEvent) {
     event.preventDefault();
-    if (!disclosure || !consented || !configState?.config || !goal.trim() || inFlight.current || activeTask) return;
+    if (!disclosure || disclosureContextKey !== sessionContextKey || !consented || !configState?.config || !goal.trim() || inFlight.current || activeTask) return;
+    const submittedGoal = goal.trim();
+    const submittedContextKey = sessionContextKey;
+    const selectionSeq = taskSelectionSeq.current;
     inFlight.current = true; setBusy("create"); setPanelError(null);
     try {
-      const body = { practice_id: practiceId, expected_revision: session?.revision ?? null, goal: goal.trim(), config_version: disclosure.config_version, consent: true as const, consent_digest: disclosure.consent_digest, limits: requestLimits };
+      const body = { practice_id: practiceId, expected_revision: session?.revision ?? null, goal: submittedGoal, config_version: disclosure.config_version, consent: true as const, consent_digest: disclosure.consent_digest, limits: requestLimits };
       const signature = JSON.stringify(body);
       if (!submissionIntent.current || submissionIntent.current.signature !== signature) {
         submissionIntent.current = { signature, key: newKey() };
@@ -150,33 +241,44 @@ export function AgentPanel({ session = null, onPracticeRefresh, onSetupDraft }: 
       // the server's original task instead of starting a second paid request.
       const task = await createAgentTask({ ...body, idempotency_key: submissionIntent.current.key });
       submissionIntent.current = null;
-      setGoal(""); setDisclosure(null); setConsented(false); setSelected(task); setEvents([]); setNextSeq(0); await refreshTasks();
-    } catch (error) { setPanelError(error instanceof Error ? error.message : "任务提交失败。"); }
+      if (sessionContextKeyRef.current === submittedContextKey) {
+        if (goalRef.current === submittedGoal) updateGoal("");
+        setDisclosure(null); setDisclosureContextKey(null); setConsented(false);
+        if (selectionSeq === taskSelectionSeq.current) openTask(task);
+        await refreshTasks();
+      }
+    } catch (error) { if (sessionContextKeyRef.current === submittedContextKey) setPanelError(error instanceof Error ? error.message : "任务提交失败。"); }
     finally { inFlight.current = false; setBusy(null); }
   }
   async function stopTask(task: AgentTask) {
+    const selectionSeq = taskSelectionSeq.current;
+    const selectedScope = taskScopeRef.current;
     setBusy("cancel"); setPanelError(null);
-    try { const stopped = await cancelAgentTask(task.task_id, cancelKeyFor(task.task_id)); setSelected(stopped); await refreshTasks(); }
-    catch (error) { setPanelError(error instanceof Error ? error.message : "停止任务失败。"); }
+    try { const stopped = await cancelAgentTask(task.task_id, cancelKeyFor(task.task_id)); if (isCurrentTask(selectionSeq, task.task_id, selectedScope)) setSelected(stopped); await refreshTasks(); }
+    catch (error) { if (isCurrentTask(selectionSeq, task.task_id, selectedScope)) setPanelError(error instanceof Error ? error.message : "停止任务失败。"); }
     finally { setBusy(null); }
   }
   async function removeTask(task: AgentTask) {
+    const selectionSeq = taskSelectionSeq.current;
+    const selectedScope = taskScopeRef.current;
     setBusy("delete"); setPanelError(null);
-    try { let current = task; if (ACTIVE.has(current.status)) { current = await cancelAgentTask(current.task_id, cancelKeyFor(current.task_id)); setSelected(current); }
+    try { let current = task; if (ACTIVE.has(current.status)) { current = await cancelAgentTask(current.task_id, cancelKeyFor(current.task_id)); if (isCurrentTask(selectionSeq, task.task_id, selectedScope)) setSelected(current); }
       if (ACTIVE.has(current.status)) throw new Error("取消请求已送达，任务仍在运行；终态后可再次删除。");
-      await deleteAgentTask(task.task_id); if (selected?.task_id === task.task_id) setSelected(null); await refreshTasks();
-    } catch (error) { setPanelError(error instanceof Error ? error.message : "删除任务失败。"); }
+      await deleteAgentTask(task.task_id); if (isCurrentTask(selectionSeq, task.task_id, selectedScope)) selectTask(null); await refreshTasks();
+    } catch (error) { if (isCurrentTask(selectionSeq, task.task_id, selectedScope)) setPanelError(error instanceof Error ? error.message : "删除任务失败。"); }
     finally { setBusy(null); }
   }
   async function prepareTrade(draft: AgentDraft) {
+    const selectionSeq = taskSelectionSeq.current;
+    const contextKey = sessionContextKey;
     setBusy("draft"); setPanelError(null); setTradeReview(null);
     try {
       if (!session || draft.practice_id !== session.practice_id || !isTradePayload(draft.payload)) throw new Error("草稿绑定或字段无效，请重新试算。");
       const current = await fetchSession(session.practice_id);
       if (current.revision !== draft.expected_revision || current.revision !== session.revision || current.revealed_date !== draft.revealed_date || !isRunning(current.status)) throw new Error("模拟日期或版本已变化，草稿过期。请重新试算后再确认。");
       const input = { ts_code: String(draft.payload.ts_code), direction: String(draft.payload.direction), planned_shares: Number(draft.payload.planned_shares) };
-      const preview = await previewOrder(session.practice_id, input); setTradeReview({ draft, preview });
-    } catch (error) { setPanelError(error instanceof Error ? error.message : "草稿试算失败。"); }
+      const preview = await previewOrder(session.practice_id, input); if (selectionSeq === taskSelectionSeq.current && contextKey === sessionContextKeyRef.current) setTradeReview({ draft, preview });
+    } catch (error) { if (selectionSeq === taskSelectionSeq.current && contextKey === sessionContextKeyRef.current) setPanelError(error instanceof Error ? error.message : "草稿试算失败。"); }
     finally { setBusy(null); }
   }
   async function submitTrade() {
@@ -201,7 +303,8 @@ export function AgentPanel({ session = null, onPracticeRefresh, onSetupDraft }: 
     <div className="agent-limit-grid">{(["rounds", "tool_calls", "timeout_seconds", "tokens"] as const).map(key => <label key={key}>{({ rounds: "模型轮次", tool_calls: "工具次数", timeout_seconds: "时限（秒）", tokens: "Token预算" })[key]}<input type="number" min="1" max={HARD_LIMITS[key]} value={limits[key]} onChange={e => setLimits({ ...limits, [key]: Math.min(HARD_LIMITS[key], Math.max(1, Number(e.target.value) || 1)) })} /></label>)}</div>
     <label className="agent-check"><input type="checkbox" checked={draftConfig.allow_loopback_http} onChange={e => setDraftConfig({ ...draftConfig, allow_loopback_http: e.target.checked })} />允许本机回环 HTTP</label>
     <label className="agent-check"><input type="checkbox" checked={draftConfig.trusted_private_https} onChange={e => setDraftConfig({ ...draftConfig, trusted_private_https: e.target.checked })} />信任私有 HTTPS 目标</label>
-    {configState?.config ? <p className="agent-muted">当前密钥：{configState.config.key_configured ? `已配置 ${configState.config.key_masked ?? ""}` : "未配置"} · 当前任务使用的版本不会随设置更改。</p> : null}
+    {configState?.config ? <p className="agent-muted">当前密钥：{configState.config.key_configured ? `已配置 ${configState.config.key_masked ?? ""}` : "未配置"} · 配置保存与连通性检测分开；当前任务使用的版本不会随设置更改。</p> : null}
+    <p className="agent-connection-state" role="status">{configState?.config && connectionCheck?.configVersion === configState.config.config_version ? connectionCheck.label : configState?.configured ? "尚未检测当前配置。保存或更改目标后需重新检测。" : "尚未配置模型目标。手动模拟仍可继续。"}</p>
     <div className="agent-actions"><button className="practice-primary" type="submit" disabled={settingsBusy}>{settingsBusy ? "保存中…" : "保存配置"}</button><button className="refresh-button" type="button" onClick={() => void runConnectionTest()} disabled={!configState?.configured || settingsBusy}>检测连接与工具能力</button></div>
     {settingsMessage ? <p className="agent-success" role="status">{settingsMessage}</p> : null}
   </form>;
@@ -211,10 +314,11 @@ export function AgentPanel({ session = null, onPracticeRefresh, onSetupDraft }: 
     {settingsOpen ? <div className="agent-settings"><h3>本地模型服务</h3><p>支持 Chat Completions 工具调用。连接检测会产生一次显式请求，可能收费；应用密钥与开发 CLI 登录无关。</p>{settingsForm}</div> : null}
     {configError ? <Notice tone="warn">{configError}。无模型时仍可直接使用历史模拟。</Notice> : null}
     {session ? <p className="agent-context-line">当前模拟：{session.name} · 修订 {session.revision} · 已揭晓至 {session.revealed_date ?? "尚无"} · 数据源 {session.source.code}（{session.source.version_id || "版本未知"}）</p> : <p className="agent-context-line">新模拟草稿范围：仅整理创建条件；不会查询账户/行情，也不会代替你提交创建。</p>}
-    {!configState?.configured ? <div className="agent-empty"><strong>配置后即可创建真实 Agent 任务</strong><span>先在模型设置中填写服务目标与密钥。没有模型也能继续手动模拟。</span><button className="refresh-button" type="button" onClick={() => setSettingsOpen(true)}>配置模型</button></div> : null}
+     {!configState?.configured ? <div className="agent-empty"><strong>配置后即可创建真实 Agent 任务</strong><span>先在模型设置中填写服务目标与密钥。没有模型也能继续手动模拟。</span>{preservedGoal ? <label className="practice-field"><span>从研究问题保留的目标</span><textarea value={goal} onChange={event => updateGoal(event.target.value)} maxLength={1200} rows={3} /></label> : null}{preservedGoal && goal === preservedGoal.text ? <p className="agent-question-retained" role="status">{configState ? "问题已保留，配置模型后可发送。" : configError ? "问题已保留，模型配置暂不可用；配置模型后可发送。" : "问题已保留，正在读取模型配置。"}</p> : null}<button className="refresh-button" type="button" onClick={() => setSettingsOpen(true)}>配置模型</button></div> : null}
     {configState?.configured ? <form className="agent-task-form" onSubmit={submitGoal}>
-      <label htmlFor="agent-goal">本次目标</label><textarea id="agent-goal" value={goal} onChange={e => setGoal(e.target.value)} maxLength={1200} rows={3} placeholder={scope === "setup" ? "例如：整理一个面向消费行业的历史模拟条件草稿" : "例如：核对当前持仓在已揭晓区间的主要风险，并引用可查证依据"} disabled={Boolean(activeTask)} />
-      <div className="agent-form-footer"><div><button type="button" className="refresh-button" onClick={() => void loadDisclosure()} disabled={Boolean(activeTask || busy || !goal.trim())}>{busy === "disclosure" ? "读取披露摘要…" : disclosure ? "刷新外发摘要" : "查看本次外发内容"}</button><span>仅读取摘要，不会发送模型请求。</span></div><button type="submit" className="practice-primary" disabled={!disclosure || !consented || !goal.trim() || Boolean(activeTask || busy)}>{busy === "create" ? "提交中…" : "同意并开始任务"}</button></div>
+      <label htmlFor="agent-goal">本次目标</label><textarea id="agent-goal" value={goal} onChange={e => updateGoal(e.target.value)} maxLength={1200} rows={3} placeholder={scope === "setup" ? "例如：整理一个面向消费行业的历史模拟条件草稿" : "例如：核对当前持仓在已揭晓区间的主要风险，并引用可查证依据"} disabled={Boolean(activeTask)} />
+      <div className="agent-suggestions" aria-label="目标建议"><span>建议问题（仅填入输入框）</span>{(scope === "setup" ? ["整理一个可检验的历史模拟条件", "列出开始研究前还缺少的资料"] : ["核对当前持仓在已揭晓区间的风险", "查找支持或反驳当前研究问题的证据"]).map(suggestion => <button key={suggestion} type="button" className="agent-suggestion" onClick={() => updateGoal(suggestion)} disabled={Boolean(activeTask)}>{suggestion}</button>)}</div>
+      <div className="agent-form-footer"><div><button type="button" className="refresh-button" onClick={() => void loadDisclosure()} disabled={Boolean(activeTask || busy || !goal.trim())}>{busy === "disclosure" ? "读取披露摘要…" : disclosure && disclosureContextKey === sessionContextKey ? "刷新外发摘要" : "查看本次外发内容"}</button><span>仅读取摘要，不会发送模型请求。</span></div><button type="submit" className="practice-primary" disabled={!disclosure || disclosureContextKey !== sessionContextKey || !consented || !goal.trim() || Boolean(activeTask || busy)}>{busy === "create" ? "提交中…" : "同意并开始任务"}</button></div>
       {disclosure ? <div className="agent-disclosure"><h3>本次数据披露与上限</h3><dl><div><dt>提供方 / 目标</dt><dd>{disclosure.target.name} · {disclosure.target.base_url} · {disclosure.target.model}</dd></div><div><dt>用途</dt><dd>{disclosure.purpose}</dd></div><div><dt>可能收费</dt><dd>{disclosure.possible_cost ? "是，取决于服务商" : "服务端标记为否"}</dd></div><div><dt>任务限制</dt><dd>{disclosure.limits.rounds} 轮 · {disclosure.limits.tool_calls} 次工具 · {disclosure.limits.timeout_seconds} 秒 · {disclosure.limits.tokens} Token（可在配置中调低）</dd></div></dl><div><strong>将发送的数据类别</strong><ul>{disclosure.data_categories.map(item => <li key={item}>{item}</li>)}</ul></div><label className="agent-consent"><input type="checkbox" checked={consented} onChange={e => setConsented(e.target.checked)} />我已阅读上述目标、用途、数据类别、收费可能与任务上限，同意发送本次任务所需的最小数据。</label></div> : null}
     </form> : null}
     {panelError ? <Notice tone="error">{panelError}</Notice> : null}
@@ -225,10 +329,10 @@ export function AgentPanel({ session = null, onPracticeRefresh, onSetupDraft }: 
       {selected.stop_reason ? <p className="agent-stop-reason">停止原因：{selected.stop_reason}</p> : null}
       {selected.status === "interrupted" && selected.resumable ? <div className="agent-disclosure"><h4>任务可恢复</h4><p>恢复状态由服务端校验。继续前需重新读取并确认本次外发内容，旧授权不会沿用。</p>{!resumeDisclosure ? <button type="button" className="refresh-button" onClick={() => void loadResumeDisclosure(selected)} disabled={Boolean(busy)}>重新生成恢复披露摘要</button> : <><dl><div><dt>提供方 / 目标</dt><dd>{resumeDisclosure.target.name} · {resumeDisclosure.target.base_url} · {resumeDisclosure.target.model}</dd></div><div><dt>用途</dt><dd>{resumeDisclosure.purpose}</dd></div><div><dt>可能收费</dt><dd>{resumeDisclosure.possible_cost ? "是，取决于服务商" : "服务端标记为否"}</dd></div><div><dt>剩余预算 / 限制</dt><dd>{resumeDisclosure.limits.rounds} 轮 · {resumeDisclosure.limits.tool_calls} 次工具 · {resumeDisclosure.limits.timeout_seconds} 秒 · {resumeDisclosure.limits.tokens} Token</dd></div></dl><strong>本次数据类别</strong><ul>{resumeDisclosure.data_categories.map(item => <li key={item}>{item}</li>)}</ul><label className="agent-consent"><input type="checkbox" checked={resumeConsented} onChange={e => setResumeConsented(e.target.checked)}/>我已重新阅读披露摘要并同意继续发送任务所需的最小数据。</label><button className="practice-primary" type="button" onClick={() => void submitResume(selected)} disabled={!resumeConsented || Boolean(busy) || !selected.operation_id || selected.generation === undefined}>同意并恢复此任务</button></>}</div> : null}
       {selected.status === "interrupted" && selected.resumable === false ? <Notice tone="warn">此任务不可恢复：{selected.stop_reason || "服务端未标记为可恢复。"}</Notice> : null}
-      <div className="agent-steps"><h4>工具步骤与状态</h4>{events.length ? <ol>{events.map(item => <li key={item.seq}><span>{KIND[item.kind] ?? item.kind}</span>{item.tool_name ? <code>{item.tool_name}</code> : null}<p>{item.summary}</p>{item.reason ? <small>{item.reason}</small> : null}{item.evidence_ids.length ? <small>证据：{item.evidence_ids.join("、")}</small> : null}</li>)}</ol> : <p className="agent-muted">{ACTIVE.has(selected.status) ? "等待服务端事件…" : "没有事件记录。"}</p>}</div>
+      <div className="agent-steps"><h4>工具步骤与状态</h4>{events.length ? <ol>{events.map(item => <li key={item.seq}><span>{KIND[item.kind] ?? item.kind}</span>{item.tool_name ? <code>{item.tool_name}</code> : null}<p>{item.summary}</p>{item.reason ? <small>停止或失败说明：{item.reason}</small> : null}{item.evidence_ids.length ? <details><summary>查看引用 ID（{item.evidence_ids.length}）</summary><ul>{item.evidence_ids.map(id => <li key={id}><code>{id}</code></li>)}</ul></details> : null}</li>)}</ol> : <p className="agent-muted">{ACTIVE.has(selected.status) ? "等待服务端事件…" : "没有事件记录。"}</p>}</div>
       {selected.result ? <div className="agent-result"><h4>结论</h4><p className="agent-result-text">{selected.result.summary}</p>{selected.result.limitations.length ? <div><h4>数据与结论限制</h4><ul>{selected.result.limitations.map((item, i) => <li key={`${i}-${item}`}>{item}</li>)}</ul></div> : null}
         {selected.result.evidence.length ? <div><h4>证据引用</h4><div className="agent-evidence-list">{selected.result.evidence.map((item, i) => { const data = item.data && typeof item.data === "object" && !Array.isArray(item.data) ? item.data as Record<string, unknown> : null; return <details key={item.evidence_id ?? i}><summary>{item.tool_name ?? "工具结果"} · {item.as_of ?? "日期未知"} · {item.evidence_id ?? `证据 ${i + 1}`}</summary><p>{item.summary ?? "核对证据摘要与固定版本引用。"}</p><dl><div><dt>版本</dt><dd>{item.version_id ?? stringify(item.version)}</dd></div>{data ? Object.entries(data).slice(0, 30).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{evidenceValue(key, value)}</dd></div>) : null}</dl>{!data && item.data !== undefined ? <pre>{stringify(item.data)}</pre> : null}</details>; })}</div></div> : null}
-        {selected.result.drafts.length ? <div><h4>待确认草稿</h4>{selected.result.drafts.map(draft => <article className="agent-draft" key={draft.draft_id}><strong>{draft.kind === "trade" ? "交易草稿" : "新模拟条件草稿"}</strong><pre>{stringify(draft.payload)}</pre>{draft.limitations.length ? <ul>{draft.limitations.map(item => <li key={item}>{item}</li>)}</ul> : null}{draft.kind === "setup" ? <button type="button" className="refresh-button" onClick={() => onSetupDraft?.(draft.payload)} disabled={!onSetupDraft || selected.stale}>填入创建模拟表单</button> : <button type="button" className="refresh-button" onClick={() => void prepareTrade(draft)} disabled={!session || selected.stale || busy === "draft" || !isTradePayload(draft.payload)}>核对并预览订单</button>}</article>)}</div> : null}
+        {selected.result.drafts.length ? <div><h4>待确认草稿</h4>{selected.result.drafts.map(draft => <article className="agent-draft" key={draft.draft_id}><strong>{draft.kind === "trade" ? "交易草稿" : "新模拟条件草稿"}</strong><p>来源：Agent 任务 · revision {draft.expected_revision ?? "未绑定"} · 已揭晓至 {draft.revealed_date ?? "无日期"}</p>{draft.limitations.length ? <ul>{draft.limitations.map(item => <li key={item}>{item}</li>)}</ul> : null}<details><summary>查看草稿字段</summary><pre>{stringify(draft.payload)}</pre></details>{draft.kind === "setup" ? <button type="button" className="refresh-button" onClick={() => onSetupDraft?.(draft.payload)} disabled={!onSetupDraft || selected.stale}>填入创建模拟表单</button> : <button type="button" className="refresh-button" onClick={() => void prepareTrade(draft)} disabled={!session || selected.stale || busy === "draft" || !isTradePayload(draft.payload)}>核对并预览订单</button>}</article>)}</div> : null}
       </div> : null}
       {tradeReview ? <div className="agent-trade-review"><h4>既有订单接口预览</h4><p>{tradeReview.draft.payload.direction === "buy" ? "买入" : "卖出"} {String(tradeReview.draft.payload.ts_code)} · {String(tradeReview.draft.payload.planned_shares)} 股</p><p>模拟日 {session?.revealed_date ?? "未知"} · 修订 {session?.revision ?? "未知"}</p><pre>{stringify(tradeReview.preview)}</pre><p>请在确认前检查系统预览与限制。确认只提交这笔订单，不推进模拟。</p><div className="agent-actions"><button className="practice-primary" type="button" disabled={Boolean(busy) || selected.stale} onClick={() => void submitTrade()}>{busy === "order" ? "提交中…" : "确认提交订单"}</button><button type="button" className="link-button" onClick={() => setTradeReview(null)} disabled={Boolean(busy)}>取消</button></div></div> : null}
       </article> : <div className="agent-task-detail agent-empty"><strong>选择任务查看步骤、结论和引用证据</strong><span>任务终态后停止轮询；历史任务可查看或删除。</span></div>}</div>

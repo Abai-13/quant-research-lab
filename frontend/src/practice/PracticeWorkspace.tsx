@@ -45,17 +45,20 @@ function readPracticeIdFromUrl(): string | null {
   return value && value.trim() !== "" ? value.trim() : null;
 }
 
-function writePracticeIdToUrl(practiceId: string | null): void {
+function writePracticeIdToUrl(practiceId: string | null, addHistoryEntry = false): void {
   if (typeof window === "undefined") {
     return;
   }
   const url = new URL(window.location.href);
+  const currentId = url.searchParams.get("practice");
+  if (currentId === practiceId) return;
   if (practiceId) {
     url.searchParams.set("practice", practiceId);
   } else {
     url.searchParams.delete("practice");
   }
-  window.history.replaceState({}, "", url);
+  if (addHistoryEntry) window.history.pushState({}, "", url);
+  else window.history.replaceState({}, "", url);
 }
 
 function readLastSessionId(): string | null {
@@ -98,6 +101,10 @@ function summaryFromSession(session: PracticeView): PracticeSummary {
   };
 }
 
+function newGoalRequestId(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
 export function PracticeWorkspace() {
   const [options, setOptions] = useState<PracticeOptions | null>(null);
   const [optionsError, setOptionsError] = useState<string | null>(null);
@@ -111,6 +118,8 @@ export function PracticeWorkspace() {
   const [session, setSession] = useState<PracticeView | null>(null);
   const [sessionLoading, setSessionLoading] = useState(false);
   const [sessionError, setSessionError] = useState<string | null>(null);
+  const [goalDraft, setGoalDraft] = useState<{ text: string; requestId: string } | null>(null);
+  const [agentPanelOpen, setAgentPanelOpen] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ tone: Tone; text: string } | null>(null);
   const [market, setMarket] = useState<MarketSeries | null>(null);
@@ -183,12 +192,12 @@ export function PracticeWorkspace() {
     }
   }, []);
 
-  const applySession = useCallback((next: PracticeView) => {
+  const applySession = useCallback((next: PracticeView, addHistoryEntry = false) => {
     setSession(next);
     setSessionId(next.practice_id);
     setLastSessionId(next.practice_id);
     storeLastSessionId(next.practice_id);
-    writePracticeIdToUrl(next.practice_id);
+    writePracticeIdToUrl(next.practice_id, addHistoryEntry);
     setSessions((current) => {
       const summary = summaryFromSession(next);
       const existing = current.findIndex((item) => item.practice_id === next.practice_id);
@@ -252,12 +261,30 @@ export function PracticeWorkspace() {
     }
   }, [loadSession]);
 
+  useEffect(() => {
+    const onPopState = () => {
+      const nextId = readPracticeIdFromUrl();
+      setSessionId(nextId);
+      setSession(null);
+      setSessionError(null);
+      setReport(null);
+      setMarket(null);
+      setDecisions([]);
+      if (nextId) void loadSession(nextId);
+      else void loadSessions();
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [loadSession, loadSessions]);
+
   async function handleCreate(input: CreatePracticeInput) {
     setCreating(true);
     setNotice(null);
+    setGoalDraft(null);
+    setAgentPanelOpen(false);
     try {
       const created = await createPractice(input);
-      applySession(created);
+      applySession(created, true);
       setReport(null);
       setDecisions([]);
       setMarket(null);
@@ -288,6 +315,8 @@ export function PracticeWorkspace() {
   }
 
   function openSession(practiceId: string) {
+    setGoalDraft(null);
+    setAgentPanelOpen(false);
     setSessionId(practiceId);
     setSession(null);
     setSessionError(null);
@@ -295,11 +324,13 @@ export function PracticeWorkspace() {
     setMarket(null);
     setReport(null);
     setDecisions([]);
-    writePracticeIdToUrl(practiceId);
+    writePracticeIdToUrl(practiceId, true);
     void loadSession(practiceId);
   }
 
   function backToHome() {
+    setGoalDraft(null);
+    setAgentPanelOpen(false);
     setSessionId(null);
     setSession(null);
     setSessionError(null);
@@ -307,7 +338,7 @@ export function PracticeWorkspace() {
     setMarket(null);
     setReport(null);
     setDecisions([]);
-    writePracticeIdToUrl(null);
+    writePracticeIdToUrl(null, true);
     void loadSessions();
   }
 
@@ -444,6 +475,8 @@ export function PracticeWorkspace() {
   }
 
   async function handleRestart(targetId: string) {
+    setGoalDraft(null);
+    setAgentPanelOpen(false);
     if (restartRef.current?.practiceId !== targetId) {
       restartRef.current = { key: crypto.randomUUID(), practiceId: targetId };
     }
@@ -453,7 +486,7 @@ export function PracticeWorkspace() {
     try {
       const created = await restartPractice(targetId, key);
       restartRef.current = null;
-      applySession(created);
+      applySession(created, true);
       setReport(null);
       setReportError(null);
       setDecisions([]);
@@ -513,6 +546,18 @@ export function PracticeWorkspace() {
     void loadMarket(session.practice_id, code);
   }
 
+  function handleSendResearchQuestion(question: string) {
+    const text = question.trim();
+    if (!text) return;
+    setGoalDraft({ text, requestId: newGoalRequestId() });
+    setAgentPanelOpen(true);
+    window.setTimeout(() => {
+      const panel = document.getElementById("practice-agent-panel");
+      panel?.scrollIntoView({ behavior: "smooth", block: "start" });
+      panel?.querySelector<HTMLElement>("summary")?.focus();
+    }, 0);
+  }
+
   if (sessionId && (sessionLoading || (!session && !sessionError))) {
     return (
       <div className="practice-home">
@@ -545,10 +590,19 @@ export function PracticeWorkspace() {
   if (session) {
     return (
       <div className="practice-home">
-        <AgentPanel
-          session={session}
-          onPracticeRefresh={() => void loadSession(session.practice_id, true, true)}
-        />
+        <details
+          className="practice-agent-drawer"
+          id="practice-agent-panel"
+          open={agentPanelOpen}
+          onToggle={(event) => setAgentPanelOpen(event.currentTarget.open)}
+        >
+          <summary>Agent 查证与任务 <span>按需展开，查看真实步骤、依据和草稿</span></summary>
+          <AgentPanel
+            session={session}
+            onPracticeRefresh={() => void loadSession(session.practice_id, true, true)}
+            goalDraft={goalDraft}
+          />
+        </details>
         <SessionView
           key={session.practice_id}
           session={session}
@@ -572,6 +626,7 @@ export function PracticeWorkspace() {
           onFinish={handleFinish}
           onRestart={() => handleRestart(session.practice_id)}
           onAddDecision={handleAddDecision}
+          onSendResearchQuestion={handleSendResearchQuestion}
           onRetryReport={() => void loadReport(session.practice_id)}
         />
       </div>

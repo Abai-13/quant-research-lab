@@ -1,0 +1,117 @@
+.practice-chart-metric {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--p7-border, #d6dbe2);
+  border-radius: var(--p7-radius, 8px);
+}
+
+.practice-chart-metric legend,
+.practice-chart-date-control > span {
+  color: var(--p7-muted, #5d6673);
+  font-size: 13px;
+}
+
+.practice-chart-metric label,
+.practice-chart-date-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 14px;
+}
+
+.practice-chart-legend {
+  align-items: center;
+}
+
+.practice-legend-item {
+  min-height: 36px;
+  padding: 6px 9px;
+  border: 1px solid var(--p7-border, #d6dbe2);
+  border-radius: 999px;
+  background: var(--p7-surface, #fff);
+  cursor: pointer;
+}
+
+.practice-legend-item[aria-pressed="false"] {
+  opacity: 0.55;
+  text-decoration: line-through;
+}
+
+.practice-legend-item:disabled {
+  cursor: not-allowed;
+}
+
+.practice-chart-date-control {
+  margin: 4px 0 8px;
+}
+
+.practice-chart-date-control select {
+  min-height: 36px;
+  padding: 5px 9px;
+  border: 1px solid var(--p7-border, #d6dbe2);
+  border-radius: 6px;
+  background: var(--p7-surface, #fff);
+  color: var(--p7-text, #20252b);
+}
+
+.practice-chart-reading {
+  margin: 0 0 8px;
+  padding: 9px 11px;
+  border-left: 3px solid var(--p7-accent, #2456c4);
+  background: var(--p7-bg, #f5f7fa);
+  line-height: 1.6;
+}
+
+.practice-chart-data {
+  margin-top: 10px;
+}
+
+.practice-chart-data summary {
+  min-height: 40px;
+  padding: 10px 0;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.practice-session :focus-visible {
+  outline: 3px solid var(--p7-accent, #2456c4);
+  outline-offset: 2px;
+}
+
+.practice-report > .muted {
+  line-height: 1.7;
+}
+
+.practice-follow-up-question {
+  display: grid;
+  justify-items: start;
+  gap: 9px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--p7-border, #d6dbe2);
+}
+
+@media (max-width: 640px) {
+  .practice-chart-metric {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .practice-chart-legend {
+    gap: 6px;
+  }
+
+  .practice-legend-item {
+    max-width: 100%;
+    flex-wrap: wrap;
+    text-align: left;
+  }
+
+  .practice-chart-data .practice-table {
+    min-width: 620px;
+  }
+}

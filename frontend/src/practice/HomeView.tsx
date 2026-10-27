@@ -62,21 +62,30 @@ export function HomeView({
 }) {
   const [restartTarget, setRestartTarget] = useState<PracticeSummary | null>(null);
   const [setupDraft, setSetupDraft] = useState<Record<string, unknown> | null>(null);
-  const [setupDraftApplied, setSetupDraftApplied] = useState(false);
+  const [setupDraftOrigin, setSetupDraftOrigin] = useState<string | null>(null);
+  const [dataPreparationOpen, setDataPreparationOpen] = useState(false);
   const runningCount = sessions.filter((session) => !isFinished(session.status)).length;
   const lastSession =
     sessions.find((session) => session.practice_id === lastSessionId) ?? sessions[0] ?? null;
   const isResume = lastSession !== null && lastSession.practice_id === lastSessionId;
 
+  function openDataPreparation() {
+    setDataPreparationOpen(true);
+    window.setTimeout(() => {
+      const summary = document.getElementById("data-prepare-summary");
+      summary?.scrollIntoView({ behavior: "smooth", block: "start" });
+      summary?.focus();
+    }, 0);
+  }
+
   return (
     <div className="practice-home">
       <section className="practice-hero">
         <div className="practice-hero-copy">
-          <p className="eyebrow">历史模拟 · Agent 任务工作台</p>
-          <h1>围绕一段历史模拟，查证目标并核对结果</h1>
+          <p className="eyebrow">历史模拟工作台</p>
+          <h1>开始一段历史模拟，或继续上次进度</h1>
           <p className="practice-hero-lead">
-            创建或继续历史模拟，查看当时行情、自主下单并逐日揭晓。Agent 可按你的目标查证与整理，系统对照和模拟报告保留数据限制，
-            不保证任何算法胜出，也不接入真实资金。
+            第一次使用可以先体验合成示例，也可以准备服务端支持的历史数据。创建后按当时可见行情操作并逐日揭晓；不接入真实资金。
           </p>
           <div className="practice-hero-actions">
             {lastSession ? (
@@ -110,43 +119,17 @@ export function HomeView({
         </dl>
       </section>
 
-      <AgentPanel onSetupDraft={(payload) => {
-        setSetupDraft(payload);
-        setSetupDraftApplied(true);
-        window.setTimeout(() => document.getElementById("new-practice-heading")?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
-      }} />
-      <DataPreparation onUseDataset={(dataset: PreparedDataset) => {
-        const weekday = (value: string, direction: 1 | -1) => {
-          const date = new Date(`${value}T00:00:00Z`);
-          while (date.getUTCDay() === 0 || date.getUTCDay() === 6) date.setUTCDate(date.getUTCDate() + direction);
-          return date.toISOString().slice(0, 10);
-        };
-        const startDate = dataset.synthetic ? weekday(dataset.start_date, 1) : dataset.start_date;
-        const endDate = dataset.synthetic ? weekday(dataset.end_date, -1) : dataset.end_date;
-        setSetupDraft({ name: dataset.synthetic ? "合成示例模拟" : "历史数据模拟", start_date: startDate, end_date: endDate, source_code: dataset.source_code, data_version_id: dataset.data_version_id });
-        setSetupDraftApplied(true);
-        onReloadOptions();
-        window.setTimeout(() => document.getElementById("new-practice-heading")?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
-      }} />
-      {setupDraftApplied ? <Notice tone="ok">Agent 条件草稿已填入创建模拟表单。请检查日期、资金、数据版本和持仓后再手动创建。</Notice> : null}
-
-      <section className="practice-steps" aria-label="历史模拟流程">
-        <div>
-          <span className="practice-step-number">1</span>
-          <p>创建模拟并设定起点</p>
-        </div>
-        <div>
-          <span className="practice-step-number">2</span>
-          <p>查看已揭晓行情并下单</p>
-        </div>
-        <div>
-          <span className="practice-step-number">3</span>
-          <p>逐日揭晓、对照三路曲线</p>
-        </div>
-        <div>
-          <span className="practice-step-number">4</span>
-          <p>结束并查看模拟报告</p>
-        </div>
+      <section className="practice-start-choices" aria-label="选择开始方式">
+        <a href="#new-practice-heading">
+          <span className="eyebrow">第一次体验</span>
+          <strong>体验合成示例</strong>
+          <span>使用明确标记的离线样本，不需要模型或服务商凭据。</span>
+        </a>
+        <button type="button" onClick={openDataPreparation}>
+          <span className="eyebrow">已有数据来源</span>
+          <strong>准备历史数据</strong>
+          <span>先查看支持来源、日期范围与资格，再由你选择是否准备。</span>
+        </button>
       </section>
 
       {notice ? (
@@ -175,6 +158,60 @@ export function HomeView({
         onPrepareDemo={onPrepareDemo}
         setupDraft={setupDraft}
       />
+
+      {setupDraftOrigin ? <Notice tone="neutral" title={`${setupDraftOrigin}已填入创建表单`}>
+        <p>请核对日期、资金、数据版本和持仓，再手动确认创建。</p>
+      </Notice> : null}
+
+      <details
+        className="practice-data-preparation"
+        id="data-prepare-section"
+        open={dataPreparationOpen}
+        onToggle={(event) => setDataPreparationOpen(event.currentTarget.open)}
+      >
+        <summary id="data-prepare-summary">高级数据准备 <span>选择服务端支持的来源、区间并查看数据资格</span></summary>
+        <p className="practice-field-hint practice-data-preparation-note">
+          这里调用独立的数据准备流程，生成的是数据集样本，不等同于上方的内置模拟演示。合成样本也可能受资格或行情范围限制；能否创建和成交以服务端结果及模拟规则为准。
+        </p>
+        <DataPreparation onUseDataset={(dataset: PreparedDataset) => {
+          const weekday = (value: string, direction: 1 | -1) => {
+            const date = new Date(`${value}T00:00:00Z`);
+            while (date.getUTCDay() === 0 || date.getUTCDay() === 6) date.setUTCDate(date.getUTCDate() + direction);
+            return date.toISOString().slice(0, 10);
+          };
+          const startDate = dataset.synthetic ? weekday(dataset.start_date, 1) : dataset.start_date;
+          const endDate = dataset.synthetic ? weekday(dataset.end_date, -1) : dataset.end_date;
+          setSetupDraft({ name: dataset.synthetic ? "合成示例模拟" : "历史数据模拟", start_date: startDate, end_date: endDate, source_code: dataset.source_code, data_version_id: dataset.data_version_id });
+          const sourceName = options?.sources.find((source) => source.code === dataset.source_code)?.label;
+          setSetupDraftOrigin(`${dataset.synthetic ? "Stage 6 受限合成数据样本" : "历史数据集"}${sourceName ? ` · ${sourceName}` : ""}`);
+          onReloadOptions();
+          window.setTimeout(() => document.getElementById("new-practice-heading")?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
+        }} />
+      </details>
+      <AgentPanel onSetupDraft={(payload) => {
+        setSetupDraft(payload);
+        setSetupDraftOrigin("Agent 条件草稿");
+        window.setTimeout(() => document.getElementById("new-practice-heading")?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
+      }} />
+
+      <section className="practice-steps" aria-label="历史模拟流程">
+        <div>
+          <span className="practice-step-number">1</span>
+          <p>创建模拟并设定起点</p>
+        </div>
+        <div>
+          <span className="practice-step-number">2</span>
+          <p>查看已揭晓行情并下单</p>
+        </div>
+        <div>
+          <span className="practice-step-number">3</span>
+          <p>逐日揭晓、对照三路曲线</p>
+        </div>
+        <div>
+          <span className="practice-step-number">4</span>
+          <p>结束并查看模拟报告</p>
+        </div>
+      </section>
 
       <section className="section" aria-labelledby="history-heading">
         <SectionHeading
