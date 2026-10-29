@@ -71,7 +71,7 @@ def save_idempotent_response(
         save()
 
 
-def create_record(conn: sqlite3.Connection, body: dict[str, Any]) -> dict[str, Any]:
+def create_record(conn: sqlite3.Connection, body: dict[str, Any], *, visibility: Mapping[str, Any] | None = None) -> dict[str, Any]:
     required = ("kind", "goal", "hypothesis", "disconfirming_condition")
     if any(not isinstance(body.get(k), str) or not body[k].strip() for k in required):
         raise ResearchError("record_fields_required", "kind、goal、hypothesis 与 disconfirming_condition 均为必填文本")
@@ -81,10 +81,15 @@ def create_record(conn: sqlite3.Connection, body: dict[str, Any]) -> dict[str, A
     with conn:
         conn.execute("INSERT INTO research_record VALUES(?,?,?,?)", (record_id, body["kind"], timestamp, revision_id))
         conn.execute("INSERT INTO research_revision VALUES(?,?,?,?,?,?)", (revision_id, record_id, None, encode(body), digest(body), timestamp))
+        if visibility is not None:
+            conn.execute("INSERT INTO research_revision_visibility VALUES(?,?,?,?,?)", (
+                revision_id, "practice", str(visibility["owner_id"]), str(visibility["visible_as_of"]),
+                int(visibility["practice_revision"]),
+            ))
     return {"record_id": record_id, "revision_id": revision_id, "parent_revision_id": None, **body, "created_at": timestamp}
 
 
-def revise_record(conn: sqlite3.Connection, record_id: str, body: dict[str, Any]) -> dict[str, Any]:
+def revise_record(conn: sqlite3.Connection, record_id: str, body: dict[str, Any], *, visibility: Mapping[str, Any] | None = None) -> dict[str, Any]:
     row = conn.execute("SELECT current_revision_id FROM research_record WHERE record_id=?", (record_id,)).fetchone()
     if row is None:
         raise ResearchError("record_not_found", "研究记录不存在", 404)
@@ -92,6 +97,11 @@ def revise_record(conn: sqlite3.Connection, record_id: str, body: dict[str, Any]
     revision_id, timestamp = "rev_" + uuid.uuid4().hex, now()
     with conn:
         conn.execute("INSERT INTO research_revision VALUES(?,?,?,?,?,?)", (revision_id, record_id, parent, encode(body), digest(body), timestamp))
+        if visibility is not None:
+            conn.execute("INSERT INTO research_revision_visibility VALUES(?,?,?,?,?)", (
+                revision_id, "practice", str(visibility["owner_id"]), str(visibility["visible_as_of"]),
+                int(visibility["practice_revision"]),
+            ))
         conn.execute("UPDATE research_record SET current_revision_id=? WHERE record_id=?", (revision_id, record_id))
     return {"record_id": record_id, "revision_id": revision_id, "parent_revision_id": parent, **body, "created_at": timestamp}
 

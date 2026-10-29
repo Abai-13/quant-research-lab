@@ -272,7 +272,7 @@ def _sync_practice_orders(
 ) -> list[dict[str, Any]]:
     orders = conn.execute(
         "SELECT o.order_id, o.idempotency_key, o.status, o.planned_shares, o.filled_shares,"
-        " o.remaining_shares, o.reason_code, o.model_price_cents, o.fee_estimate_cents, p.detail_json"
+        " o.remaining_shares, o.reason_code, o.model_price_cents, o.fee_estimate_cents, p.detail_json, o.trade_date"
         " FROM simulation_order o JOIN practice_order p ON p.idempotency_key=o.idempotency_key"
         " WHERE o.segment_id=? AND p.practice_id=? AND o.trade_date<=?"
         " AND p.status IN ('pending','partially_filled') ORDER BY o.trade_date, o.order_id",
@@ -293,22 +293,43 @@ def _sync_practice_orders(
             "rejected": "rejected",
             "expired": "expired",
         }.get(engine_status, engine_status)
-        detail = dict(engine_result) if engine_result is not None else {
-            "order_id": str(row[0]),
+        try:
+            prior_detail = json.loads(str(row[9]))
+        except (TypeError, ValueError):
+            prior_detail = {}
+        detail = dict(prior_detail) if isinstance(prior_detail, dict) else {}
+        if engine_result is not None:
+            # Keep each engine response's cash flow scoped to the trade-date
+            # attempt; the order-level fields below come from the cumulative DB row.
+            attempt = {**engine_result, "trade_date": str(trade_date)}
+            attempts = detail.get("attempts")
+            attempts = list(attempts) if isinstance(attempts, list) else []
+            attempts = [
+                item for item in attempts
+                if not isinstance(item, dict) or item.get("trade_date") != str(trade_date)
+            ]
+            attempts.append(attempt)
+            detail.update(engine_result)
+            detail["attempts"] = attempts
+            detail["cash_flow_scope"] = "latest_attempt"
+            detail["cash_spent_total_cents"] = sum(
+                int(item.get("cash_spent_cents") or 0) for item in attempts if isinstance(item, dict)
+            )
+            detail["net_proceeds_total_cents"] = sum(
+                int(item.get("net_proceeds_cents") or 0) for item in attempts if isinstance(item, dict)
+            )
+        else:
+            detail["order_id"] = str(row[0])
+        # These values represent the live cumulative order state and must not
+        # inherit stale pending/partial values from a prior detail payload.
+        detail.update({
             "status": engine_status,
             "filled_shares": int(row[4]),
             "reason_code": row[6],
             "remaining_shares": int(row[5]),
             "model_price_cents": row[7],
             "fee_estimate_cents": row[8],
-        }
-        try:
-            prior_detail = json.loads(str(row[9]))
-        except (TypeError, ValueError):
-            prior_detail = {}
-        if isinstance(prior_detail, dict):
-            prior_detail.update(detail)
-            detail = prior_detail
+        })
         # Core's order_id is distinct from the S5 engine id; match by its stable request key.
         conn.execute(
             "UPDATE practice_order SET filled_shares=?, status=?, detail_json=?"

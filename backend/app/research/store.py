@@ -12,6 +12,8 @@ from app.config import Settings
 SCHEMA = (
     "CREATE TABLE IF NOT EXISTS research_record (record_id TEXT PRIMARY KEY, kind TEXT NOT NULL, created_at TEXT NOT NULL, current_revision_id TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS research_revision (revision_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES research_record(record_id), parent_revision_id TEXT, body_json TEXT NOT NULL, body_sha256 TEXT NOT NULL, created_at TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS research_revision_visibility (revision_id TEXT PRIMARY KEY REFERENCES research_revision(revision_id), owner_type TEXT NOT NULL CHECK(owner_type='practice'), owner_id TEXT NOT NULL, visible_as_of TEXT NOT NULL CHECK(length(visible_as_of)=8), practice_revision INTEGER NOT NULL CHECK(practice_revision>=1))",
+    "CREATE INDEX IF NOT EXISTS idx_research_revision_visibility_owner_date ON research_revision_visibility(owner_type,owner_id,visible_as_of)",
     "CREATE INDEX IF NOT EXISTS idx_research_revision_record ON research_revision(record_id, created_at)",
     "CREATE TABLE IF NOT EXISTS research_plan (plan_id TEXT PRIMARY KEY, plan_revision INTEGER NOT NULL, status TEXT NOT NULL, plan_json TEXT NOT NULL, plan_sha256 TEXT NOT NULL, created_at TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS research_experiment (experiment_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, status TEXT NOT NULL, status_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",

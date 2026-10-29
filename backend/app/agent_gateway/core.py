@@ -38,11 +38,54 @@ _CONFIG_LOCK = threading.RLock()
 class GatewayError(RuntimeError):
     """Public-safe gateway failure with a stable reason and status."""
 
-    def __init__(self, reason: str, detail: str, status_code: int = 400):
+    def __init__(self, reason: str, detail: str, status_code: int = 400, *,
+                 diagnostic: str | None = None, usage: dict[str, int | None] | None = None,
+                 finish_reason: str | None = None):
         super().__init__(detail)
         self.reason = reason
         self.detail = detail
         self.status_code = status_code
+        self.diagnostic = diagnostic
+        self.usage = usage
+        self.finish_reason = finish_reason
+
+
+class ProviderResponseError(ValueError):
+    """Response validation failure carrying only a fixed public diagnostic."""
+
+    def __init__(self, diagnostic: str):
+        super().__init__(diagnostic)
+        self.diagnostic = diagnostic
+
+
+_SAFE_FINISH_REASONS = {"stop", "tool_calls", "length", "content_filter"}
+
+
+def _safe_finish_reason(response: object) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return None
+    finish = choices[0].get("finish_reason")
+    return finish if isinstance(finish, str) and finish in _SAFE_FINISH_REASONS else "unknown"
+
+
+def _trusted_response_usage(response: object) -> dict[str, int | None]:
+    empty: dict[str, int | None] = {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+    if not isinstance(response, dict):
+        return empty
+    raw = response.get("usage")
+    if not isinstance(raw, dict):
+        return empty
+    values = (raw.get("prompt_tokens"), raw.get("completion_tokens"), raw.get("total_tokens"))
+    if any(value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0)
+           for value in values):
+        return empty
+    prompt, completion, total = values
+    if prompt is not None and completion is not None and total is not None and total != prompt + completion:
+        return empty
+    return {"input_tokens": prompt, "output_tokens": completion, "total_tokens": total}
 
 
 def _key_mask(key: str) -> str:
@@ -394,6 +437,10 @@ class GatewayService:
                                        "max_tokens": max_output_tokens, "n": 1, "stream": False}
             if tools:
                 payload.update({"tools": tools, "tool_choice": "auto", "parallel_tool_calls": False})
+            if endpoint.hostname == "api.deepseek.com":
+                # Agent requests do not retain DeepSeek reasoning_content between calls;
+                # disable thinking for tool turns and fresh evidence-only summaries.
+                payload["thinking"] = {"type": "disabled"}
             encoded_payload = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
             if len(encoded_payload.encode("utf-8")) > 1_048_576:
                 raise GatewayError("invalid_request", "Model request exceeds the supported size")
@@ -432,20 +479,30 @@ class GatewayService:
                 raise GatewayError(exc.reason, "Could not reach the configured model endpoint", 502) from exc
             except asyncio.TimeoutError as exc:
                 raise GatewayError("timeout", "Model request timed out", 504) from exc
+            except Exception as exc:
+                raise GatewayError("provider_error", "Model endpoint request failed", 502) from exc
             if status != 200:
                 # Never expose provider response bodies; they can echo authorization material.
                 raise GatewayError("provider_http_error", f"Model endpoint returned HTTP {status}", 502)
             try:
+                try:
+                    serialized_response = json.dumps(response, separators=(",", ":"), ensure_ascii=False)
+                except (TypeError, ValueError):
+                    serialized_response = ""
+                if api_key in serialized_response:
+                    raise GatewayError("invalid_provider_response", "Model endpoint returned an invalid response", 502,
+                                       diagnostic="protected_data")
                 normalized = normalize_completion(response)
-                if api_key in json.dumps(normalized, separators=(",", ":"), ensure_ascii=False):
-                    raise ValueError("provider response contains protected data")
                 if cancel_event.is_set():
                     raise GatewayError("cancelled", "Model request cancelled", 409)
                 return normalized
             except GatewayError:
                 raise
             except ValueError as exc:
-                raise GatewayError("invalid_provider_response", "Model endpoint returned an invalid response", 502) from exc
+                diagnostic = exc.diagnostic if isinstance(exc, ProviderResponseError) else "invalid_provider_response"
+                raise GatewayError("invalid_provider_response", "Model endpoint returned an invalid response", 502,
+                                   diagnostic=diagnostic, usage=_trusted_response_usage(response),
+                                   finish_reason=_safe_finish_reason(response)) from exc
         finally:
             cancel_wait.cancel()
             await asyncio.gather(cancel_wait, return_exceptions=True)
@@ -468,82 +525,104 @@ class GatewayService:
             result = await self.request_completion(
                 version, [{"role": "user", "content": "Call gateway_capability_probe with value ok."}],
                 [definition], timeout_seconds=min(20, active_record["limits"]["timeout_seconds"]),
-                max_output_tokens=min(32, active_record["limits"]["tokens"]), cancel_event=asyncio.Event(),
+                max_output_tokens=min(256, active_record["limits"]["tokens"]), cancel_event=asyncio.Event(),
             )
             calls = result["message"]["tool_calls"]
-            return {"reachable": True, "tool_supported": bool(calls), "reason": None if calls else "tool_call_not_returned",
+            supported = (len(calls) == 1 and calls[0]["function"]["name"] == "gateway_capability_probe"
+                         and json.loads(calls[0]["function"]["arguments"]) == {"value": "ok"})
+            return {"reachable": True, "tool_supported": supported,
+                    "reason": None if supported else "tool_call_not_returned",
+                    "diagnostic": None if supported else {"code": "probe_tool_mismatch"},
                     "usage": {**result["usage"], "elapsed_ms": int((time.monotonic() - start) * 1000)}}
         except GatewayError as exc:
             reachable = exc.reason in {"provider_http_error", "invalid_provider_response"}
+            usage = exc.usage or {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+            diagnostic: dict[str, str] | None = None
+            if exc.diagnostic == "protected_data":
+                diagnostic = {"code": "protected_data"}
+                usage = {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+            elif exc.diagnostic is not None:
+                diagnostic = {"code": exc.diagnostic, "finish_reason": exc.finish_reason}
             return {"reachable": reachable, "tool_supported": False, "reason": exc.reason,
-                    "usage": {"input_tokens": None, "output_tokens": None, "total_tokens": None,
-                              "elapsed_ms": int((time.monotonic() - start) * 1000)}}
+                    "diagnostic": diagnostic,
+                    "usage": {**usage, "elapsed_ms": int((time.monotonic() - start) * 1000)}}
 
 
 def normalize_completion(response: object) -> dict[str, Any]:
     if not isinstance(response, dict) or response.get("object") != "chat.completion":
-        raise ValueError("invalid completion object")
+        raise ProviderResponseError("invalid_completion_object")
     choices = response.get("choices")
     if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
-        raise ValueError("invalid choices")
+        raise ProviderResponseError("invalid_choices")
     choice = choices[0]
     if choice.get("index") != 0:
-        raise ValueError("invalid choice index")
+        raise ProviderResponseError("invalid_choice_index")
     finish = choice.get("finish_reason")
-    if finish not in {"stop", "tool_calls", "length", "content_filter"}:
-        raise ValueError("unsupported finish reason")
+    if not isinstance(finish, str) or finish not in _SAFE_FINISH_REASONS:
+        raise ProviderResponseError("invalid_finish_reason")
     raw_message = choice.get("message")
     if not isinstance(raw_message, dict) or raw_message.get("role") != "assistant":
-        raise ValueError("invalid assistant message")
+        raise ProviderResponseError("invalid_assistant_message")
     content = raw_message.get("content")
     if content is not None and not isinstance(content, str):
-        raise ValueError("invalid content")
+        raise ProviderResponseError("invalid_content")
     raw_calls = raw_message.get("tool_calls")
     if raw_calls is None:
         raw_calls = []
     if not isinstance(raw_calls, list) or len(raw_calls) > 32:
-        raise ValueError("invalid tool calls")
+        raise ProviderResponseError("invalid_tool_calls")
     normalized_calls: list[dict[str, Any]] = []
     seen: set[str] = set()
     for call in raw_calls:
         if not isinstance(call, dict) or call.get("type") != "function":
-            raise ValueError("invalid tool call")
+            raise ProviderResponseError("invalid_tool_call")
         call_id = call.get("id")
         function = call.get("function")
         if not isinstance(call_id, str) or not call_id or len(call_id) > 128 or call_id in seen:
-            raise ValueError("invalid tool call id")
+            raise ProviderResponseError("invalid_tool_id")
         if not isinstance(function, dict) or not isinstance(function.get("name"), str):
-            raise ValueError("invalid tool function")
+            raise ProviderResponseError("invalid_tool_function")
         name, arguments = function["name"], function.get("arguments")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", name) or not isinstance(arguments, str) or len(arguments) > 65536:
-            raise ValueError("invalid tool arguments")
+            raise ProviderResponseError("invalid_tool_arguments")
         def unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             result: dict[str, Any] = {}
             for key, value in pairs:
                 if key in result:
-                    raise ValueError("duplicate tool argument key")
+                    raise ProviderResponseError("duplicate_tool_argument_key")
                 result[key] = value
             return result
 
-        decoded = json.loads(arguments, object_pairs_hook=unique_pairs,
-                             parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("invalid JSON constant")))
+        try:
+            decoded = json.loads(arguments, object_pairs_hook=unique_pairs,
+                                 parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("invalid JSON constant")))
+        except json.JSONDecodeError as exc:
+            raise ProviderResponseError("invalid_tool_arguments_json") from exc
+        except ValueError as exc:
+            if isinstance(exc, ProviderResponseError):
+                raise
+            raise ProviderResponseError("invalid_tool_arguments_json") from exc
         if not isinstance(decoded, dict):
-            raise ValueError("tool arguments must be an object")
+            raise ProviderResponseError("tool_arguments_not_object")
         normalized_calls.append({"id": call_id, "type": "function",
                                  "function": {"name": name, "arguments": json.dumps(decoded, separators=(",", ":"), ensure_ascii=False)}})
         seen.add(call_id)
     if finish == "tool_calls" and not normalized_calls:
-        raise ValueError("tool finish without a call")
+        raise ProviderResponseError("tool_finish_without_call")
     usage_raw = response.get("usage")
     usage: dict[str, int | None] = {"input_tokens": None, "output_tokens": None, "total_tokens": None}
     if usage_raw is not None:
         if not isinstance(usage_raw, dict):
-            raise ValueError("invalid usage")
+            raise ProviderResponseError("invalid_usage")
         for target, source in (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens"), ("total_tokens", "total_tokens")):
             item = usage_raw.get(source)
             if item is not None and (isinstance(item, bool) or not isinstance(item, int) or item < 0):
-                raise ValueError("invalid usage count")
+                raise ProviderResponseError("invalid_usage")
             usage[target] = item
+        if (usage["input_tokens"] is not None and usage["output_tokens"] is not None
+                and usage["total_tokens"] is not None
+                and usage["total_tokens"] != usage["input_tokens"] + usage["output_tokens"]):
+            raise ProviderResponseError("inconsistent_usage")
     return {"message": {"role": "assistant", "content": content, "tool_calls": normalized_calls},
             "usage": usage, "finish_reason": finish}
 

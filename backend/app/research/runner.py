@@ -42,6 +42,30 @@ def _backup(source_path: Path, target_path: Path) -> None:
         source.close()
 
 
+def _summarize_variant_metrics(nav_values: list[int], fills: tuple[int, int, int],
+                               restrictions: Any = None, performance_method: Any = None) -> dict[str, Any]:
+    """Summarize integer-cent outputs exactly; basis points use ROUND_HALF_UP."""
+    if not nav_values or int(nav_values[0]) <= 0:
+        raise ValueError("initial NAV must be positive")
+    nav = [int(value) for value in nav_values]
+    trade_count, costs_cents, notional_cents = map(int, fills)
+    ret = int(((Decimal(nav[-1]) / Decimal(nav[0]) - 1) * 10_000).quantize(
+        Decimal("1"), rounding=ROUND_HALF_UP
+    ))
+    peak, drawdown = nav[0], 0
+    for value in nav[1:]:
+        peak = max(peak, value)
+        drawdown = min(drawdown, int(((Decimal(value) / Decimal(peak) - 1) * 10_000).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )))
+    turnover = int((Decimal(notional_cents) * Decimal(10_000) / Decimal(nav[0])).quantize(
+        Decimal("1"), rounding=ROUND_HALF_UP
+    ))
+    return {"return_bps": ret, "drawdown_bps": drawdown, "cost_cents": costs_cents,
+            "trade_count": trade_count, "turnover_bps": turnover,
+            "restrictions": restrictions, "performance_method": performance_method}
+
+
 def _run_variant(source_path: Path, directory: Path, practice_id: str, cadence: int,
                  dates: list[str], metric_dates: list[str], deadline: float,
                  *, finish: bool = True) -> dict[str, Any]:
@@ -83,15 +107,11 @@ def _run_variant(source_path: Path, directory: Path, practice_id: str, cadence: 
         nav_values = [point["nav_cents"] for point in base_points[-1:] + metric_points]
         if any(value is None for value in nav_values) or int(nav_values[0]) <= 0:
             raise ExperimentBlocked("valuation_incomplete", "训练/评估区间估值不完整")
-        ret = int(((Decimal(int(nav_values[-1]) / Decimal(int(nav_values[0])) - 1) * 10_000).quantize(Decimal("1"), rounding=ROUND_HALF_UP)))
-        peak, drawdown = int(nav_values[0]), 0
-        for value in map(int, nav_values[1:]):
-            peak = max(peak, value)
-            drawdown = min(drawdown, int(((Decimal(value) / Decimal(peak) - 1) * 10_000).quantize(Decimal("1"), rounding=ROUND_HALF_UP)))
         fills = conn.execute("SELECT COUNT(DISTINCT CASE WHEN f.filled_shares>0 THEN f.order_id END),COALESCE(SUM(f.fee_cents+f.slippage_cents),0),COALESCE(SUM(ABS(f.filled_shares*f.price_cents)),0) FROM simulation_fill f JOIN simulation_order o ON o.order_id=f.order_id WHERE o.segment_id=? AND o.trade_date BETWEEN ? AND ?", (path["segment_id"], metric_dates[0], metric_dates[-1])).fetchone()
-        return {"return_bps": ret, "drawdown_bps": drawdown, "cost_cents": int(fills[1]),
-                "trade_count": int(fills[0]), "turnover_bps": int(Decimal(int(fills[2]) * 10_000 / int(nav_values[0])).quantize(Decimal("1"))),
-                "restrictions": path.get("restrictions"), "performance_method": path.get("performance_method")}
+        return _summarize_variant_metrics(
+            list(map(int, nav_values)), (int(fills[0]), int(fills[1]), int(fills[2])),
+            path.get("restrictions"), path.get("performance_method"),
+        )
     finally:
         conn.close()
 

@@ -32,6 +32,49 @@ def _replay(response: dict[str, Any]) -> Any:
     return JSONResponse(status_code=code, content={key: value for key, value in response.items() if key != "_http_status"}) if code != 200 else {key: value for key, value in response.items() if key != "_http_status"}
 
 
+def _practice_snapshot(request: Request, practice_id: str) -> sqlite3.Row | None:
+    settings = getattr(request.app.state, "settings", None) or load_settings()
+    practice_path = settings.runtime_dir.resolve() / "practice" / "app.db"
+    try:
+        practice = sqlite3.connect(practice_path.as_uri() + "?mode=ro", uri=True, timeout=3.0)
+        practice.row_factory = sqlite3.Row
+        try:
+            practice.execute("PRAGMA query_only=ON")
+            return practice.execute(
+                "SELECT revealed_date,revision FROM practice_session WHERE practice_id=?", (practice_id,)
+            ).fetchone()
+        finally:
+            practice.close()
+    except (sqlite3.Error, OSError) as exc:
+        raise ResearchError("simulation_source_unavailable", "cannot verify referenced practice session", 422) from exc
+
+
+def _bind_simulation_visibility(request: Request, body: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Sanitize record content and return server-owned per-revision visibility."""
+    payload = dict(body)
+    # This was previously accepted as arbitrary body JSON. It is never trusted.
+    payload.pop("simulation_visible_as_of", None)
+    if payload.get("scope") != "simulation":
+        return payload, None
+    evidence_as_of = payload.get("evidence_as_of")
+    if not isinstance(evidence_as_of, str) or not re.fullmatch(r"\d{8}", evidence_as_of):
+        raise ResearchError("simulation_evidence_date_invalid", "simulation records require YYYYMMDD evidence_as_of")
+    refs = payload.get("source_refs")
+    if not isinstance(refs, list) or not refs or any(not isinstance(ref, dict) for ref in refs):
+        raise ResearchError("simulation_source_required", "simulation records must reference the current practice session")
+    owner_ids = {str(ref.get("owner_id", "")) for ref in refs}
+    if len(owner_ids) != 1 or not next(iter(owner_ids), ""):
+        raise ResearchError("simulation_source_mismatch", "simulation references must bind one practice session")
+    practice_id = next(iter(owner_ids))
+    session = _practice_snapshot(request, practice_id)
+    if session is None:
+        raise ResearchError("simulation_source_not_found", "referenced practice session does not exist", 422)
+    revealed_date = str(session["revealed_date"])
+    if evidence_as_of > revealed_date:
+        raise ResearchError("simulation_evidence_in_future", "evidence_as_of cannot exceed the current revealed date")
+    return payload, {"owner_id": practice_id, "visible_as_of": revealed_date,
+                     "practice_revision": int(session["revision"])}
+
 def create_research_router() -> APIRouter:
     router = APIRouter(prefix="/api/research", tags=["research"])
 
@@ -48,8 +91,11 @@ def create_research_router() -> APIRouter:
             if q.strip():
                 filters.append("body_json LIKE ?"); filter_params.append(f"%{q.strip()[:200]}%")
             if practice_id:
-                cte = "WITH visible AS (SELECT r.record_id,r.kind,r.created_at record_created_at,v.revision_id,v.parent_revision_id,v.body_json,v.body_sha256,v.created_at revision_created_at,ROW_NUMBER() OVER(PARTITION BY r.record_id ORDER BY v.created_at DESC,v.rowid DESC) rn FROM research_record r JOIN research_revision v ON v.record_id=r.record_id WHERE json_extract(v.body_json,'$.evidence_as_of') IS NOT NULL AND json_extract(v.body_json,'$.evidence_as_of')<=? AND substr(replace(v.created_at,'-',''),1,8)<=? AND (json_extract(v.body_json,'$.scope')='global' OR (json_extract(v.body_json,'$.scope')='simulation' AND EXISTS(SELECT 1 FROM json_each(v.body_json,'$.source_refs') ref WHERE json_extract(ref.value,'$.owner_id')=?))))"
-                base_params = [as_of, as_of, practice_id]
+                session = _practice_snapshot(request, practice_id)
+                if session is None or as_of > str(session["revealed_date"]):
+                    return {"ok": True, "records": [], "total": 0, "limit": limit, "offset": offset}
+                cte = "WITH visible AS (SELECT r.record_id,r.kind,r.created_at record_created_at,v.revision_id,v.parent_revision_id,v.body_json,v.body_sha256,v.created_at revision_created_at,ROW_NUMBER() OVER(PARTITION BY r.record_id ORDER BY v.created_at DESC,v.rowid DESC) rn FROM research_record r JOIN research_revision v ON v.record_id=r.record_id LEFT JOIN research_revision_visibility vis ON vis.revision_id=v.revision_id WHERE json_extract(v.body_json,'$.evidence_as_of') IS NOT NULL AND json_extract(v.body_json,'$.evidence_as_of')<=? AND ((json_extract(v.body_json,'$.scope')='global' AND substr(replace(v.created_at,'-',''),1,8)<=?) OR (json_extract(v.body_json,'$.scope')='simulation' AND EXISTS(SELECT 1 FROM json_each(v.body_json,'$.source_refs') ref WHERE json_extract(ref.value,'$.owner_id')=?) AND ((vis.revision_id IS NOT NULL AND vis.owner_type='practice' AND vis.owner_id=? AND vis.visible_as_of<=?) OR (vis.revision_id IS NULL AND substr(replace(v.created_at,'-',''),1,8)<=?)))))"
+                base_params = [as_of, as_of, practice_id, practice_id, as_of, as_of]
                 where = " WHERE rn=1" + (" AND " + " AND ".join(filters) if filters else "")
                 count = int(conn.execute(cte + " SELECT COUNT(*) FROM visible" + where, [*base_params, *filter_params]).fetchone()[0])
                 rows = conn.execute(cte + " SELECT * FROM visible" + where + " ORDER BY record_created_at DESC,record_id LIMIT ? OFFSET ?", [*base_params, *filter_params, limit, offset]).fetchall()
@@ -73,8 +119,8 @@ def create_research_router() -> APIRouter:
             replay = idempotent_replay(conn, "create_record", body)
             if replay is not None:
                 return _replay(replay)
-            payload = {key: value for key, value in body.items() if key != "idempotency_key"}
-            response = {"ok": True, "record": create_record(conn, payload)}
+            payload, visibility = _bind_simulation_visibility(request, {key: value for key, value in body.items() if key != "idempotency_key"})
+            response = {"ok": True, "record": create_record(conn, payload, visibility=visibility)}
             save_idempotent_response(conn, "create_record", body, response)
             return response
         except ResearchError as exc:
@@ -91,10 +137,13 @@ def create_research_router() -> APIRouter:
             params: list[Any] = [record_id]
             if practice_id:
                 if not as_of or not re.fullmatch(r"\d{8}", as_of):
-                    return JSONResponse(status_code=404, content={"ok": False, "reason": "record_not_visible", "detail": "模拟受限查询必须提供有效 as_of 日期"})
-                where += " AND json_extract(v.body_json,'$.evidence_as_of') IS NOT NULL AND json_extract(v.body_json,'$.evidence_as_of')<=? AND substr(replace(v.created_at,'-',''),1,8)<=? AND (json_extract(v.body_json,'$.scope')='global' OR (json_extract(v.body_json,'$.scope')='simulation' AND EXISTS(SELECT 1 FROM json_each(v.body_json,'$.source_refs') ref WHERE json_extract(ref.value,'$.owner_id')=?)))"
-                params.extend((as_of, as_of, practice_id))
-            base = " FROM research_record r JOIN research_revision v ON v.record_id=r.record_id WHERE " + where
+                    return JSONResponse(status_code=404, content={"ok": False, "reason": "record_not_visible", "detail": "valid as_of required"})
+                session = _practice_snapshot(request, practice_id)
+                if session is None or as_of > str(session["revealed_date"]):
+                    return JSONResponse(status_code=404, content={"ok": False, "reason": "record_not_visible", "detail": "as_of exceeds current revealed date"})
+                where += " AND json_extract(v.body_json,'$.evidence_as_of') IS NOT NULL AND json_extract(v.body_json,'$.evidence_as_of')<=? AND ((json_extract(v.body_json,'$.scope')='global' AND substr(replace(v.created_at,'-',''),1,8)<=?) OR (json_extract(v.body_json,'$.scope')='simulation' AND EXISTS(SELECT 1 FROM json_each(v.body_json,'$.source_refs') ref WHERE json_extract(ref.value,'$.owner_id')=?) AND ((vis.revision_id IS NOT NULL AND vis.owner_type='practice' AND vis.owner_id=? AND vis.visible_as_of<=?) OR (vis.revision_id IS NULL AND substr(replace(v.created_at,'-',''),1,8)<=?))))"
+                params.extend((as_of, as_of, practice_id, practice_id, as_of, as_of))
+            base = " FROM research_record r JOIN research_revision v ON v.record_id=r.record_id LEFT JOIN research_revision_visibility vis ON vis.revision_id=v.revision_id WHERE " + where
             latest = conn.execute("SELECT r.kind,r.created_at record_created_at,v.*" + base + " ORDER BY v.created_at DESC,v.rowid DESC LIMIT 1", params).fetchone()
             if latest is None:
                 return JSONResponse(status_code=404, content={"ok": False, "reason": "record_not_found", "detail": "研究记录不存在"})
@@ -114,13 +163,18 @@ def create_research_router() -> APIRouter:
         conn = _connect(request)
         try:
             operation = f"append_revision:{record_id}"
-            replay = reserve_idempotency(conn, operation, body)
+            replay = idempotent_replay(conn, operation, body)
             if replay is not None and replay.get("pending"):
                 return JSONResponse(status_code=202, content={"ok": True, "pending": True, "detail": "相同请求仍在处理中；请稍后重试相同幂等键。"})
             if replay is not None:
                 return _replay(replay)
-            payload = {key: value for key, value in body.items() if key != "idempotency_key"}
-            response = {"ok": True, "revision": revise_record(conn, record_id, payload)}
+            payload, visibility = _bind_simulation_visibility(request, {key: value for key, value in body.items() if key != "idempotency_key"})
+            replay = reserve_idempotency(conn, operation, body)
+            if replay is not None and replay.get("pending"):
+                return JSONResponse(status_code=202, content={"ok": True, "pending": True})
+            if replay is not None:
+                return _replay(replay)
+            response = {"ok": True, "revision": revise_record(conn, record_id, payload, visibility=visibility)}
             save_idempotent_response(conn, operation, body, response)
             return response
         except ResearchError as exc:

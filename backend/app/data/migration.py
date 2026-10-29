@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Protocol
 
 from . import schema as schema_mod
-from .backup import create_backup
+from .backup import create_backup, validate_recovery_point
 from .chunks import convert_legacy_version, version_members
 from .locking import DataWriteLock
 from .maintenance import latest_run, open_maintenance, start_run, update_run
@@ -414,7 +414,13 @@ def _migrate_locked(
             if fail_after_step == "after_metadata":
                 raise MigrationInjectedFailure("injected failure after metadata check")
 
-            backup = create_backup(settings, verify=True)
+            # Hold the main DB writer reservation while the shared snapshotter
+            # freezes the remaining runtime stores. The current transaction has
+            # made no writes, so an independent SQLite backup reads the same
+            # committed source state without reacquiring our own lock.
+            conn.execute("BEGIN IMMEDIATE")
+            backup = create_backup(settings, verify=True,
+                                   held_writer_locks={Path(settings.db_path)})
             backup_db = backup.path / "app.db"
             update_run(
                 side, run_id, state="backup_verified", backup_path=str(backup.path)
@@ -423,6 +429,13 @@ def _migrate_locked(
                 raise MigrationInjectedFailure("injected failure after backup")
             if fail_after_step == "after_verify_backup":
                 raise MigrationInjectedFailure("injected failure after backup verification")
+
+            # Migration helpers commit their schema steps. If a writer slipped
+            # between releasing and retaking SQLite's lock, refuse the stale
+            # recovery point before applying any schema change.
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            validate_recovery_point(settings, backup.path, current_conn=conn)
 
             if original_version == 1:
                 _migrate_1_to_2(conn, str(backup_db))

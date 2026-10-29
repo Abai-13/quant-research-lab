@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import threading
 import time
 
@@ -148,6 +149,48 @@ def test_prepare_publishes_versionview_ready_snapshot_and_content_cache(tmp_path
         client.close()
         reset_practice_connect_provider()
 
+
+def test_twenty_short_prepare_jobs_keep_executor_bounded_and_history_accounted(tmp_path):
+    client, settings = _client(tmp_path)
+    from app.practice_data import operations
+
+    baseline_threads = len(threading.enumerate())
+    baseline_children = len(multiprocessing.active_children())
+    operations.startup_operations(settings)
+    completed = []
+    try:
+        for index in range(20):
+            code = f"sh.{600000 + index}"
+            body = {
+                "source_code": "synthetic", "symbols": [code],
+                "start_date": "2024-07-01", "end_date": "2024-07-05",
+                "idempotency_key": f"phase8-short-job-{index}",
+            }
+            submitted = client.post("/data/prepare", json=body)
+            assert submitted.status_code == 202, submitted.text
+            job_id = submitted.json()["operation_id"]
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                job = client.get(f"/data/jobs/{job_id}").json()
+                if job["status"] in {"completed", "failed", "interrupted"}:
+                    break
+                time.sleep(0.01)
+            assert job["status"] == "completed", job
+            completed.append(job_id)
+            assert len(threading.enumerate()) <= baseline_threads + 3
+            assert len(multiprocessing.active_children()) == baseline_children
+    finally:
+        client.close()
+        operations.shutdown_operations(wait=True)
+        reset_practice_connect_provider()
+
+    with practice_connect(settings) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM practice_data_job").fetchone()[0] == 20
+        assert conn.execute("SELECT COUNT(*) FROM practice_data_job_unit").fetchone()[0] == 20
+        assert conn.execute("SELECT COUNT(*) FROM practice_data_version").fetchone()[0] == 20
+    assert len(completed) == 20
+    assert len(threading.enumerate()) <= baseline_threads + 1
+    assert len(multiprocessing.active_children()) == baseline_children
 
 def test_cancel_fences_late_source_result(tmp_path, monkeypatch):
     client, settings = _client(tmp_path)

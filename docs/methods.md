@@ -43,3 +43,11 @@ py -3.12 .\backend\examples\deterministic_sample.py
 - **已支持**：基线动量/趋势计算、稳定过滤排名、版本化等权目标和现金保留、模拟订单费用/滑点分项、支持范围内公司行为、完整估值下的区间收益及回撤。
 - **受限**：严格历史发布时点资格、历史股票池完整性、股票停牌/上市资格覆盖、缺行情估值、未确认税后分红、费用规则缺失。
 - **未实现或被拒绝**：目标分配阶段的换手预算折算；复杂公司行为处置；将未知数据猜成数值；由目标报告自动产生或执行订单。
+
+## 研究指标与模拟订单明细
+
+研究运行器以 Decimal 计算收益、回撤和换手率等指标，再按整数基点输出；基点换算和其他金额舍入使用 `ROUND_HALF_UP`，现金成本保留为整数分。指标应结合对应的数据、规则和运行版本解读，不应把有限样本结果视为收益保证。
+
+历史模拟订单详情会区分单次推进与订单累计值：`detail.cash_spent_cents` 和 `detail.net_proceeds_cents` 描述最近一次 attempt 的现金流，`cash_flow_scope` 标注为 `latest_attempt`；`cash_spent_total_cents` 与 `net_proceeds_total_cents` 才是跨 attempt 累计现金流。订单的 `filled_shares`、`remaining_shares` 和状态是订单累计结果；每次 attempt 的成交日期和撮合结果保留在 attempts 明细中。查看部分成交或多次推进时，应分别读取 attempt 现金流和订单累计成交量，避免把最近一次金额当成总金额。
+
+DeepSeek 当前按非推理 Chat Completions 工具模式运行；推理链回传尚未实现。此实现说明不代表已经完成真实服务连接验收。

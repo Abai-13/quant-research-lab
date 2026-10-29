@@ -5,20 +5,24 @@ import hashlib
 import sqlite3
 import threading
 import time
+from decimal import Decimal, ROUND_HALF_UP
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from datetime import timedelta
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 
+from app.api import research as research_api
 from app.api.research import create_research_router
 from app.agent_tools.research import invoke_research_tool
-from app.agent_tools.service import capture_context, execute_tool, tool_definitions
+from app.agent_tools.service import _output, capture_context, execute_tool, tool_definitions
 from app.research.exposure import assess_exposure, normalize_symbol, register_exposure
-from app.research.service import ResearchError, validate_plan
+from app.research.service import ResearchError, create_record, validate_plan
 from app.research.store import research_connect, research_path
 from app.research.store import maintenance_reference_snapshot
+from app.research.runner import _summarize_variant_metrics
 from app.research.service import create_plan, maintenance_reference_snapshot as service_reference_snapshot
 from app.research import executor as research_executor
 from app.research import store as research_store
@@ -46,15 +50,29 @@ def _plan(**overrides):
 
 
 def test_research_api_append_only_search_and_as_of(temp_settings):
+    with practice_connect(temp_settings) as practice:
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        for practice_id in ("p1", "p2"):
+            practice.execute(
+                "INSERT INTO practice_session(practice_id,name,status,revision,start_date,end_date,revealed_date,data_version_id,source_code,segments_json,settings_json,user_state_json,created_at,updated_at) VALUES(?,?,'active',1,'20250101','20991231',?,'v1','synthetic','[]','{}','{}','now','now')",
+                (practice_id, practice_id, today),
+            )
     app = FastAPI()
     app.state.settings = temp_settings
     app.include_router(create_research_router())
     with TestClient(app) as client:
+        legal_source_refs = [
+            {"owner_type": "practice", "owner_id": "p1", "source_code": "synthetic", "data_version_id": "v1"},
+            {"owner_type": "practice", "owner_id": "p1", "source_code": "synthetic", "data_version_id": "v2",
+             "symbols": ["AAA"], "interval": {"start_date": "20250101", "end_date": "20250102"}},
+            {"owner_type": "practice", "owner_id": "p1", "source_code": "evidence", "data_version_id": "evidence-v1",
+             "evidence_id": "ev-1", "research_record_id": "rr-source-1"},
+        ]
         record_body = {
             "idempotency_key": "record-create-1",
             "scope": "simulation", "kind": "hypothesis", "goal": "reduce churn", "hypothesis": "10 day cadence lowers fees",
             "disconfirming_condition": "net return falls", "evidence_as_of": "20250101",
-            "source_refs": [{"owner_type": "practice", "owner_id": "p1", "data_version_id": "v1"}],
+            "source_refs": legal_source_refs,
         }
         created = client.post("/api/research/records", json=record_body).json()["record"]
         replayed = client.post("/api/research/records", json=record_body).json()["record"]
@@ -64,8 +82,19 @@ def test_research_api_append_only_search_and_as_of(temp_settings):
             "idempotency_key": "record-revision-1",
             "scope": "simulation", "kind": "hypothesis", "goal": "revised", "hypothesis": "include drawdown",
             "disconfirming_condition": "drawdown rises", "evidence_as_of": "20250102",
+            "source_refs": legal_source_refs,
+        }).json()["revision"]
+        later_revision = client.post(f"/api/research/records/{created['record_id']}/revisions", json={
+            "idempotency_key": "record-revision-visible-later",
+            "scope": "simulation", "kind": "hypothesis", "goal": "later revision", "hypothesis": "must stay hidden",
+            "disconfirming_condition": "later visibility", "evidence_as_of": today,
             "source_refs": [{"owner_id": "p1"}],
         }).json()["revision"]
+        with research_connect(temp_settings) as conn:
+            conn.execute(
+                "UPDATE research_revision_visibility SET visible_as_of='20991231' WHERE revision_id=?",
+                (later_revision["revision_id"],),
+            )
         future = client.post(f"/api/research/records/{created['record_id']}/revisions", json={
             "idempotency_key": "record-revision-2",
             "scope": "simulation", "kind": "hypothesis", "goal": "future", "hypothesis": "future result leaked",
@@ -107,6 +136,8 @@ def test_research_api_append_only_search_and_as_of(temp_settings):
         hidden_future_global = client.get(f"/api/research/records/{future_global['record_id']}?as_of={as_of}&practice_id=p1")
         hidden_undated_global = client.get(f"/api/research/records/{undated_global['record_id']}?as_of={as_of}&practice_id=p1")
         search = client.get(f"/api/research/records?q=drawdown&practice_id=p1&as_of={as_of}").json()
+        hidden_later_search = client.get(f"/api/research/records?q=must%20stay%20hidden&practice_id=p1&as_of={as_of}").json()
+        foreign_search = client.get(f"/api/research/records?q=other%20simulation&practice_id=p1&as_of={as_of}").json()
     assert changed["parent_revision_id"] == created["revision_id"]
     assert replayed["record_id"] == created["record_id"]
     assert conflict.status_code == 409
@@ -116,17 +147,67 @@ def test_research_api_append_only_search_and_as_of(temp_settings):
     assert hidden_future_global.status_code == 404
     assert hidden_undated_global.status_code == 404
     assert visible.json()["record"]["body"]["hypothesis"] == "include drawdown"
+    assert visible.json()["record"]["revision_id"] == changed["revision_id"]
+    assert visible.json()["record"]["body"]["source_refs"] == legal_source_refs
     assert len(visible.json()["record"]["revision_history"]) == 2
-    assert future.json()["revision"]["hypothesis"] == "future result leaked"
+    assert future.status_code == 422
     assert search["records"] and search["records"][0]["record_id"] == created["record_id"], search
+    assert search["records"][0]["revision_id"] == changed["revision_id"]
+    assert hidden_later_search["records"] == []
+    assert foreign_search["records"] == []
     with research_connect(temp_settings) as conn:
         assert conn.execute("SELECT COUNT(*) FROM research_revision WHERE record_id=?", (created["record_id"],)).fetchone()[0] == 3
     assert research_path(temp_settings).parent == temp_settings.runtime_dir / "research"
     agent_result = invoke_research_tool(temp_settings, {"scope": "simulation", "practice_id": "p1", "revealed_date": as_of}, "search_research_records", {"query": "global facts", "limit": 10})
     assert [item["record_id"] for item in agent_result["records"]] == [global_record["record_id"]]
-    assert invoke_research_tool(temp_settings, {"scope": "simulation", "practice_id": "p1", "revealed_date": as_of}, "search_research_records", {"query": "must not be injected", "limit": 10})["records"] == []
-    assert invoke_research_tool(temp_settings, {"scope": "simulation", "practice_id": "p1", "revealed_date": as_of}, "search_research_records", {"query": "future global facts", "limit": 10})["records"] == []
-    for hidden_id in (unscoped["record_id"], future_global["record_id"], undated_global["record_id"]):
+    assert agent_result["records"][0]["revision_id"] == global_record["revision_id"]
+    assert agent_result["records"][0]["evidence_as_of"] == as_of
+    assert agent_result["records"][0]["as_of"] == agent_result["as_of"] == as_of
+    assert agent_result["records"][0]["scope"] == "global"
+    # Search and direct read must identify the same latest visible revision.
+    revised_search = invoke_research_tool(
+        temp_settings, {"scope": "simulation", "practice_id": "p1", "revealed_date": as_of},
+        "search_research_records", {"query": "drawdown", "limit": 10},
+    )
+    revised_item = next(item for item in revised_search["records"] if item["record_id"] == created["record_id"])
+    revised_read = invoke_research_tool(
+        temp_settings, {"scope": "simulation", "practice_id": "p1", "revealed_date": as_of},
+        "read_research_record", {"record_id": created["record_id"]},
+    )
+    assert revised_item["revision_id"] == revised_read["revision_id"] == changed["revision_id"]
+    assert revised_item["evidence_as_of"] == revised_read["evidence_as_of"] == "20250102"
+    assert revised_item["owner_id"] == revised_read["owner_id"] == "p1"
+    assert revised_item["body"]["source_refs"] == revised_read["body"]["source_refs"] == legal_source_refs
+    assert revised_read["as_of"] == revised_search["as_of"] == as_of
+    hidden_result = invoke_research_tool(
+        temp_settings, {"scope": "simulation", "practice_id": "p1", "revealed_date": as_of},
+        "search_research_records", {"query": "must stay hidden", "limit": 10},
+    )
+    foreign_result = invoke_research_tool(
+        temp_settings, {"scope": "simulation", "practice_id": "p1", "revealed_date": as_of},
+        "search_research_records", {"query": "other simulation", "limit": 10},
+    )
+    for unavailable in (hidden_result, foreign_result):
+        assert unavailable["records"] == []
+        assert unavailable["notice"] == "当前可见范围内没有找到匹配记录。可以换个关键词或说法再试。"
+    wrapped = _output(
+        {"practice_id": "p1", "revision": 1, "revealed_date": as_of,
+         "context_fingerprint": "test-context", "limitations": []},
+        "search_research_records", revised_search, "visible research snapshot",
+    )
+    wrapped_item = next(item for item in wrapped["evidence"][0]["data"]["records"]
+                        if item["record_id"] == created["record_id"])
+    assert wrapped["evidence"][0]["as_of"] == wrapped["as_of"] == as_of
+    assert wrapped["evidence"][0]["version"]["practice_id"] == wrapped_item["owner_id"] == "p1"
+    assert wrapped_item["revision_id"] == changed["revision_id"]
+    future_results = [
+        invoke_research_tool(temp_settings, {"scope": "simulation", "practice_id": "p1", "revealed_date": as_of}, "search_research_records", {"query": query, "limit": 10})
+        for query in ("must not be injected", "future global facts")
+    ]
+    for unavailable in future_results:
+        assert unavailable["records"] == []
+        assert unavailable["notice"] == "当前可见范围内没有找到匹配记录。可以换个关键词或说法再试。"
+    for hidden_id in (unscoped["record_id"], foreign["record_id"], future_global["record_id"], undated_global["record_id"]):
         try:
             invoke_research_tool(temp_settings, {"scope": "simulation", "practice_id": "p1", "revealed_date": as_of}, "read_research_record", {"record_id": hidden_id})
         except ResearchError as exc:
@@ -185,6 +266,94 @@ def test_frozen_plan_idempotency_is_atomic_across_sqlite_connections(temp_settin
         assert conn.execute("SELECT COUNT(*) FROM research_idempotency WHERE operation='create_plan'").fetchone()[0] == 1
 
 
+def test_research_plan_api_waits_for_held_write_lock_before_commit(temp_settings, monkeypatch):
+    with research_connect(temp_settings):
+        pass
+    path = research_path(temp_settings)
+    first = sqlite3.connect(path, timeout=2.0, isolation_level=None)
+    begin_attempted = threading.Event()
+    begin_acquired = threading.Event()
+    wait_seconds = []
+
+    class ObservedConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=(), /):
+            if sql.strip().upper() == "BEGIN IMMEDIATE":
+                begin_attempted.set()
+                started = time.monotonic()
+                result = super().execute(sql, parameters)
+                wait_seconds.append(time.monotonic() - started)
+                begin_acquired.set()
+                return result
+            return super().execute(sql, parameters)
+
+    def observed_connect(settings):
+        conn = sqlite3.connect(
+            research_path(settings), timeout=2.0, isolation_level=None,
+            factory=ObservedConnection,
+        )
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    monkeypatch.setattr(research_api, "research_connect", observed_connect)
+    app = FastAPI()
+    app.state.settings = temp_settings
+    app.include_router(create_research_router())
+    body = {"idempotency_key": "plan-lock-wait", **_plan()}
+
+    # Keep A's write transaction open while the actual POST route reaches its
+    # production create_plan BEGIN IMMEDIATE call through connection B.
+    first.execute("BEGIN IMMEDIATE")
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            pending = pool.submit(client.post, "/api/research/plans", json=body)
+            assert begin_attempted.wait(timeout=2), "API did not reach create_plan's write-lock call"
+            time.sleep(0.25)
+            assert not begin_acquired.is_set(), "connection B acquired A's held write lock"
+            assert not pending.done(), "API response completed while B was still waiting"
+            first.commit()
+            assert begin_acquired.wait(timeout=2)
+            response = pending.result(timeout=2)
+            assert response.status_code == 200, response.text
+            assert wait_seconds and wait_seconds[0] >= 0.2
+        finally:
+            if first.in_transaction:
+                first.rollback()
+            first.close()
+
+    with research_connect(temp_settings) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM research_plan").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM research_idempotency WHERE operation='create_plan'").fetchone()[0] == 1
+
+
+def test_research_variant_metrics_round_exact_integer_inputs_without_float():
+    nav_cents = 20_000_000_000_000_001
+    notional_cents = 3_000_000_000_000
+    exact_turnover = Decimal(notional_cents) * Decimal(10_000) / Decimal(nav_cents)
+    assert exact_turnover == Decimal("1.499999999999999925")
+    assert exact_turnover < Decimal("1.5")
+    # The old int/float division rounded this value to exactly 1.5; this is the
+    # negative control showing why the monetary inputs must stay as Decimal.
+    assert notional_cents * 10_000 / nav_cents == 1.5
+
+    result = _summarize_variant_metrics(
+        [nav_cents, nav_cents],
+        (1, 37, notional_cents),
+        restrictions=["synthetic"],
+        performance_method="fixture-v1",
+    )
+    expected_turnover = int(exact_turnover.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    assert expected_turnover == 1
+    assert result == {
+        "return_bps": 0,
+        "drawdown_bps": 0,
+        "cost_cents": 37,
+        "trade_count": 1,
+        "turnover_bps": expected_turnover,
+        "restrictions": ["synthetic"],
+        "performance_method": "fixture-v1",
+    }
+
+
 def test_failed_frozen_plan_response_write_rolls_back_for_retry(temp_settings):
     app = FastAPI()
     app.state.settings = temp_settings
@@ -212,6 +381,123 @@ def test_failed_frozen_plan_response_write_rolls_back_for_retry(temp_settings):
     with research_connect(temp_settings) as conn:
         assert conn.execute("SELECT COUNT(*) FROM research_plan").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM research_idempotency WHERE operation='create_plan'").fetchone()[0] == 1
+
+
+def test_agent_research_legacy_visibility_fallback_is_read_only(temp_settings):
+    path = research_path(temp_settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        ("rr_visible", "rev_visible", {
+            "scope": "simulation", "evidence_as_of": "20250101",
+            "source_refs": [{"owner_id": "practice-1"}], "goal": "legacy visible",
+        }, "2024-12-31T12:00:00+00:00"),
+        ("rr_foreign", "rev_foreign", {
+            "scope": "simulation", "evidence_as_of": "20250101",
+            "source_refs": [{"owner_id": "practice-2"}], "goal": "legacy foreign",
+        }, "2024-12-31T12:00:00+00:00"),
+        ("rr_spoof", "rev_spoof", {
+            "scope": "simulation", "evidence_as_of": "20250101",
+            "simulation_visible_as_of": "20991231",
+            "source_refs": [{"owner_id": "practice-1"}], "goal": "legacy forged clock",
+        }, "2025-01-03T12:00:00+00:00"),
+        ("rr_global_future", "rev_global_future", {
+            "scope": "global", "evidence_as_of": "20991231", "goal": "future global",
+        }, "2024-12-31T12:00:00+00:00"),
+        ("rr_global_visible", "rev_global_visible", {
+            "scope": "global", "evidence_as_of": "20250101", "goal": "current global",
+        }, "2024-12-31T12:00:00+00:00"),
+    ]
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE research_record(record_id TEXT PRIMARY KEY,kind TEXT NOT NULL,created_at TEXT NOT NULL,current_revision_id TEXT NOT NULL)")
+        conn.execute("CREATE TABLE research_revision(revision_id TEXT PRIMARY KEY,record_id TEXT NOT NULL,parent_revision_id TEXT,body_json TEXT NOT NULL,body_sha256 TEXT NOT NULL,created_at TEXT NOT NULL)")
+        for record_id, revision_id, body, created_at in rows:
+            conn.execute("INSERT INTO research_record VALUES(?,?,?,?)", (record_id, "observation", created_at, revision_id))
+            conn.execute("INSERT INTO research_revision VALUES(?,?,?,?,?,?)", (
+                revision_id, record_id, None, json.dumps(body, sort_keys=True),
+                hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest(), created_at,
+            ))
+        conn.commit()
+
+    before_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    context = {"scope": "simulation", "practice_id": "practice-1", "revealed_date": "20250102"}
+    result = invoke_research_tool(temp_settings, context, "search_research_records", {"query": "", "limit": 20})
+    ids = {item["record_id"] for item in result["records"]}
+    assert ids == {"rr_visible", "rr_global_visible"}
+    assert "notice" not in result
+    assert invoke_research_tool(temp_settings, context, "read_research_record", {"record_id": "rr_visible"})["body"]["goal"] == "legacy visible"
+    for hidden_id in ("rr_foreign", "rr_spoof", "rr_global_future"):
+        with pytest.raises(ResearchError) as excinfo:
+            invoke_research_tool(temp_settings, context, "read_research_record", {"record_id": hidden_id})
+        assert excinfo.value.reason == "record_not_found"
+    with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as conn:
+        assert conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='research_revision_visibility'").fetchone() is None
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before_digest
+
+
+def test_agent_research_query_does_not_initialize_missing_store(temp_settings):
+    path = research_path(temp_settings)
+    context = {"scope": "simulation", "practice_id": "practice-1", "revealed_date": "20250102"}
+    with pytest.raises(ResearchError) as excinfo:
+        invoke_research_tool(temp_settings, context, "search_research_records", {"query": "", "limit": 5})
+    assert excinfo.value.reason == "research_database_missing"
+    assert not path.exists()
+    assert not path.parent.exists()
+
+
+def test_agent_research_visibility_owner_mismatch_never_uses_legacy_fallback(temp_settings):
+    body = {
+        "scope": "simulation", "evidence_as_of": "20250101",
+        "source_refs": [{"owner_id": "practice-1"}], "goal": "must not downgrade",
+    }
+    with research_connect(temp_settings) as conn:
+        created = create_record(conn, {
+            "kind": "observation", "goal": body["goal"], "hypothesis": "test",
+            "disconfirming_condition": "test", **body,
+        }, visibility={"owner_id": "practice-2", "visible_as_of": "20250101", "practice_revision": 1})
+    context = {"scope": "simulation", "practice_id": "practice-1", "revealed_date": "20250102"}
+    with pytest.raises(ResearchError) as excinfo:
+        invoke_research_tool(temp_settings, context, "read_research_record", {"record_id": created["record_id"]})
+    assert excinfo.value.reason == "record_not_found"
+    assert invoke_research_tool(temp_settings, context, "search_research_records", {
+        "query": "must not downgrade", "limit": 5,
+    }) == {
+        "records": [], "as_of": "20250102", "practice_id": "practice-1",
+        "scope": "application_research_only",
+        "notice": "当前可见范围内没有找到匹配记录。可以换个关键词或说法再试。",
+    }
+
+
+def test_agent_research_query_replays_visible_record_without_like_wildcards(temp_settings):
+    context = {"scope": "simulation", "practice_id": "practice-search", "revealed_date": "20250102"}
+    with research_connect(temp_settings) as conn:
+        record = create_record(conn, {
+            "kind": "synthetic_agent_acceptance_note",
+            "goal": "M3queryXshouldnotmatchY",
+            "hypothesis": "visible synthetic research record",
+            "disconfirming_condition": "synthetic counterexample",
+            "scope": "simulation",
+            "evidence_as_of": "20250101",
+            "source_refs": [{"owner_type": "practice", "owner_id": "practice-search"}],
+        }, visibility={
+            "owner_id": "practice-search", "visible_as_of": "20250101", "practice_revision": 1,
+        })
+
+    exact = invoke_research_tool(temp_settings, context, "search_research_records", {
+        "query": "M3queryXshouldnotmatchY", "kind": "synthetic_agent_acceptance_note", "limit": 10,
+    })["records"]
+    assert [item["record_id"] for item in exact] == [record["record_id"]]
+    detail = invoke_research_tool(temp_settings, context, "read_research_record", {
+        "record_id": record["record_id"],
+    })
+    assert exact[0]["revision_id"] == detail["revision_id"] == record["revision_id"]
+
+    # LIKE's '_' and '%' used to fabricate matches for absent literal substrings.
+    for query in ("M3query_shouldnotmatchY", "M3query%shouldnotmatchY", r"M3query\XshouldnotmatchY"):
+        result = invoke_research_tool(temp_settings, context, "search_research_records", {
+            "query": query, "kind": "synthetic_agent_acceptance_note", "limit": 10,
+        })
+        assert result["records"] == []
+        assert result["notice"] == "当前可见范围内没有找到匹配记录。可以换个关键词或说法再试。"
 
 
 def test_exposure_assessment_ignores_version_and_marks_unknown(temp_settings):
@@ -269,7 +555,69 @@ def test_legacy_practice_history_is_seeded_as_unknown_not_unseen(temp_settings):
     assert result["unknown_count"] > 0
 
 
+def test_simulation_research_is_visible_at_server_bound_revealed_date(temp_settings):
+    with practice_connect(temp_settings) as practice:
+        for practice_id in ("sim-a", "sim-b"):
+            practice.execute(
+                "INSERT INTO practice_session(practice_id,name,status,revision,start_date,end_date,revealed_date,data_version_id,source_code,segments_json,settings_json,user_state_json,created_at,updated_at) VALUES(?,?,'active',1,'20241101','20241231','20241119','v1','synthetic','[]','{}','{}','now','now')",
+                (practice_id, practice_id),
+            )
+    app = FastAPI()
+    app.state.settings = temp_settings
+    app.include_router(create_research_router())
+    with TestClient(app) as client:
+        created_response = client.post("/api/research/records", json={
+            "idempotency_key": "sim-record-day-1", "scope": "simulation", "kind": "hypothesis",
+            "goal": "same-day record", "hypothesis": "visible immediately at the revealed date",
+            "disconfirming_condition": "counterexample", "evidence_as_of": "20241119",
+            "source_refs": [{"owner_type": "practice", "owner_id": "sim-a", "data_version_id": "v1"}],
+        })
+        assert created_response.status_code == 200, created_response.text
+        created = created_response.json()["record"]
+        same_day = client.get(f"/api/research/records/{created['record_id']}?as_of=20241119&practice_id=sim-a")
+        assert same_day.status_code == 200, same_day.text
+        same_day_search = client.get("/api/research/records?q=same-day&as_of=20241119&practice_id=sim-a")
+        assert same_day_search.json()["total"] == 1
+
+        with practice_connect(temp_settings) as practice:
+            practice.execute("UPDATE practice_session SET revealed_date='20241120',revision=revision+1 WHERE practice_id='sim-a'")
+        revised = client.post(f"/api/research/records/{created['record_id']}/revisions", json={
+            "idempotency_key": "sim-record-day-2", "scope": "simulation", "kind": "hypothesis",
+            "goal": "revised after advance", "hypothesis": "new revision",
+            "disconfirming_condition": "counterexample", "evidence_as_of": "20241120",
+            "source_refs": [{"owner_type": "practice", "owner_id": "sim-a", "data_version_id": "v1"}],
+        })
+        assert revised.status_code == 200, revised.text
+        past = client.get(f"/api/research/records/{created['record_id']}?as_of=20241119&practice_id=sim-a")
+        current = client.get(f"/api/research/records/{created['record_id']}?as_of=20241120&practice_id=sim-a")
+        foreign = client.get(f"/api/research/records/{created['record_id']}?as_of=20241120&practice_id=sim-b")
+        assert past.status_code == current.status_code == 200
+        assert past.json()["record"]["body"]["hypothesis"] == "visible immediately at the revealed date"
+        assert current.json()["record"]["body"]["hypothesis"] == "new revision"
+        assert foreign.status_code == 404
+        assert client.get(f"/api/research/records/{created['record_id']}?as_of=20241121&practice_id=sim-a").status_code == 404
+        forged = client.post("/api/research/records", json={
+            "idempotency_key": "sim-forged-visible-date", "scope": "simulation", "kind": "hypothesis",
+            "goal": "forged clock", "hypothesis": "backdated", "disconfirming_condition": "counterexample",
+            "evidence_as_of": "20241120", "simulation_visible_as_of": "20240101",
+            "source_refs": [{"owner_type": "practice", "owner_id": "sim-a"}],
+        })
+        assert forged.status_code == 200, forged.text
+        assert "simulation_visible_as_of" not in forged.json()["record"]
+        assert client.get(f"/api/research/records/{forged.json()['record']['record_id']}?as_of=20241119&practice_id=sim-a").status_code == 404
+        with research_connect(temp_settings) as research:
+            legacy = create_record(research, {
+                "scope": "simulation", "kind": "hypothesis", "goal": "legacy forged field",
+                "hypothesis": "untrusted JSON clock", "disconfirming_condition": "counterexample",
+                "evidence_as_of": "20241119", "simulation_visible_as_of": "20241119",
+                "source_refs": [{"owner_type": "practice", "owner_id": "sim-a"}],
+            })
+        assert client.get(f"/api/research/records/{legacy['record_id']}?as_of=20241119&practice_id=sim-a").status_code == 404
+
+
 def test_agent_research_tools_are_scoped_and_draft_only(temp_settings):
+    # Production bootstrap creates the store; a read-only Agent tool must not.
+    research_connect(temp_settings).close()
     context = {"scope": "simulation", "practice_id": "p1", "revealed_date": "20250105"}
     prepared = invoke_research_tool(temp_settings, context, "prepare_experiment_draft", {"plan": _plan()})
     assert prepared["starts_experiment"] is False

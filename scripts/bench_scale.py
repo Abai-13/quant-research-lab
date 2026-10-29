@@ -363,6 +363,7 @@ def run_storage(codes: int, years: int, workdir: Path, increments: int, manifest
         t0 = time.perf_counter()
         data_status(settings)
         timings.append(time.perf_counter() - t0)
+    result["status_call_p50_seconds"] = round(statistics.median(timings), 4)
     result["status_call_p95_seconds"] = round(_p95(timings), 4)
     result["status_call_mean_seconds"] = round(statistics.mean(timings), 4)
     result["status_call_samples"] = len(timings)
@@ -508,6 +509,7 @@ def run_pipeline(codes: int, years: int, workdir: Path, smoke: int, increments: 
         t0 = time.perf_counter()
         data_status(settings)
         direct.append(time.perf_counter() - t0)
+    result["status_direct_p50_seconds"] = round(statistics.median(direct), 4)
     result["status_direct_p95_seconds"] = round(_p95(direct), 4)
     result["status_direct_mean_seconds"] = round(statistics.mean(direct), 4)
     try:
@@ -523,6 +525,7 @@ def run_pipeline(codes: int, years: int, workdir: Path, smoke: int, increments: 
                 response = client.get("/api/data/status")
                 assert response.status_code == 200, response.text
                 http.append(time.perf_counter() - t0)
+        result["status_http_p50_seconds"] = round(statistics.median(http), 4)
         result["status_http_p95_seconds"] = round(_p95(http), 4)
         result["status_http_mean_seconds"] = round(statistics.mean(http), 4)
     except Exception as exc:  # pragma: no cover - optional

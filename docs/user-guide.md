@@ -46,3 +46,16 @@
 ## 数据和能力限制
 
 真实历史的来源许可、覆盖范围、历史股票池、上市/退市及停牌状态、严格历史发布时间资格可能不完整，页面会显示资格限制。公司行为目前只支持证据充分的现金分红及送转流程；复杂配股、合并和退市处置不推测。内置演示和高级合成样本都不是投资或策略有效性的证据；高级受限合成样本可能不满足订单或系统股票池资格。
+
+## 备份与恢复
+
+恢复前先停止正在运行的本地实例。恢复命令的 `--to` 接收一个新的 runtime 根目录，而不是数据库文件路径；主数据库位于新目录下的 `data/app.db`。例如：
+
+```powershell
+$env:APP_RUNTIME_DIR = [IO.Path]::GetFullPath('.runtime-restored')
+$env:APP_DB_PATH = Join-Path $env:APP_RUNTIME_DIR 'data\app.db'
+backend\.venv\Scripts\python.exe -m app.data.cli restore --from .runtime\backups\<备份包> --to $env:APP_RUNTIME_DIR
+scripts\start-local.ps1
+```
+
+目标目录必须是新的空路径，恢复不会覆盖当前 runtime。v2 备份把主库还原到 `data/app.db`；兼容的 v1 备份也会把数据库放到该位置，并按旧格式还原 raw/archive 文件。恢复不包含模型凭据，请在本机重新配置 Key。切换回默认 runtime 前，先停止实例，再清除 `APP_RUNTIME_DIR` 和 `APP_DB_PATH`。

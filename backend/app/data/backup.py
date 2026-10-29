@@ -22,6 +22,7 @@ import shutil
 import sqlite3
 import tempfile
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,8 +43,13 @@ __all__ = [
     "verify_registered_recovery_point",
 ]
 
-BACKUP_FORMAT = "backup-package-v1"
+BACKUP_FORMAT = "backup-package-v2"
+LEGACY_BACKUP_FORMATS = {"backup-package-v1"}
 MANIFEST_NAME = "backup-manifest.json"
+SNAPSHOT_LIMITATION = (
+    "Full-runtime backups require the application and background jobs to be stopped and drained. "
+    "SQLite writer reservations serialize the snapshot window but do not coordinate multi-database workflows."
+)
 
 
 @dataclass
@@ -425,6 +431,15 @@ def _ensure_within(package: Path, target: Path) -> Path:
     return target_resolved
 
 
+def _safe_relative(value: Any) -> Path:
+    raw = str(value or "")
+    path = Path(raw)
+    if (not raw or path.is_absolute() or ".." in path.parts or
+            (len(raw) >= 2 and raw[1] == ":") or raw.startswith(("\\\\", "//"))):
+        raise DataError("backup_path_escape", f"不安全的相对路径: {raw}")
+    return path
+
+
 def _copy_file(source: Path, target: Path, *, allow_hardlink: bool) -> str:
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
@@ -456,7 +471,47 @@ def _sqlite_snapshot(source_path: Path, target_path: Path) -> None:
         source.close()
 
 
-def create_backup(
+def _runtime_databases(settings) -> list[tuple[Path, str]]:
+    """Every persistent SQLite store that must move with a runtime directory."""
+    runtime = Path(settings.runtime_dir)
+    return [
+        (Path(settings.db_path), "data/app.db"),
+        (runtime / "maintenance.db", "maintenance.db"),
+        (runtime / "practice" / "app.db", "practice/app.db"),
+        (runtime / "research" / "research.sqlite3", "research/research.sqlite3"),
+        (runtime / "agent" / "tasks.sqlite3", "agent/tasks.sqlite3"),
+        (runtime / "agent" / "maintenance.sqlite3", "agent/maintenance.sqlite3"),
+    ]
+
+
+def _runtime_external_files(settings) -> list[tuple[Path, str]]:
+    """Return non-database research artifacts with safe runtime-relative paths."""
+    root = Path(settings.runtime_dir).resolve()
+    experiments = root / "research" / "experiments"
+    if not experiments.exists():
+        return []
+    result: list[tuple[Path, str]] = []
+    for current, dirs, names in os.walk(experiments, followlinks=False):
+        base = Path(current)
+        for name in list(dirs):
+            path = base / name
+            if path.is_symlink() or (getattr(path.lstat(), "st_file_attributes", 0) & 0x400):
+                raise DataError("backup_unsafe_source", f"研究工件包含重解析目录: {path}")
+        for name in names:
+            path = base / name
+            if path.is_symlink() or (getattr(path.lstat(), "st_file_attributes", 0) & 0x400):
+                raise DataError("backup_unsafe_source", f"研究工件包含重解析文件: {path}")
+            if not path.is_file():
+                raise DataError("backup_unsafe_source", f"研究工件不是普通文件: {path}")
+            try:
+                relative = path.resolve(strict=True).relative_to(root).as_posix()
+            except (OSError, ValueError) as exc:
+                raise DataError("backup_unsafe_source", f"研究工件路径逃逸: {path}") from exc
+            result.append((path, relative))
+    return sorted(result, key=lambda item: item[1])
+
+
+def _create_backup_impl(
     settings,
     *,
     out_dir: Path | None = None,
@@ -490,8 +545,21 @@ def create_backup(
     db_sha = _sha256_file(backup_db)
     files: list[dict[str, Any]] = []
     logical = backup_db.stat().st_size
-    for index, (stored, expected, kind) in enumerate(external):
-        source = _source_path(settings, stored, kind)
+    external_refs = [(stored, expected, kind, settings, "")
+                     for stored, expected, kind in external]
+    practice_path = Path(settings.runtime_dir) / "practice" / "app.db"
+    if practice_path.is_file():
+        from app.practice.runtime import practice_settings
+        practice_config = practice_settings(settings)
+        practice_conn = _readonly_connection(practice_path)
+        try:
+            external_refs.extend((stored, expected, kind, practice_config, "practice/")
+                                 for stored, expected, kind in _external_paths(practice_conn))
+        finally:
+            practice_conn.close()
+
+    for index, (stored, expected, kind, source_settings, restore_prefix) in enumerate(external_refs):
+        source = _source_path(source_settings, stored, kind)
         if not source.is_file():
             raise DataError("backup_missing_file", f"备份失败：外部文件缺失 {stored}")
         actual = _sha256_file(source)
@@ -507,22 +575,18 @@ def create_backup(
         logical += size
         files.append(
             {
-                "path": stored,
+                "path": f"{restore_prefix}{stored}",
                 "kind": kind,
                 "package_path": package_path,
+                "restore_path": f"{restore_prefix}{'data/raw' if kind == 'raw' else 'archives'}/{stored}",
                 "sha256": expected,
                 "bytes": size,
                 "storage": mode,
             }
         )
 
-    # Side databases are snapshotted consistently and explicitly allowlisted.
-    # Credential storage under agent/gateway is intentionally excluded.
-    side_databases = [
-        (Path(settings.runtime_dir) / "maintenance.db", "maintenance.db"),
-        (Path(settings.runtime_dir) / "agent" / "tasks.sqlite3", "agent/tasks.sqlite3"),
-        (Path(settings.runtime_dir) / "agent" / "maintenance.sqlite3", "agent/maintenance.sqlite3"),
-    ]
+    # Product databases are copied while the wrapper holds all writer locks.
+    side_databases = _runtime_databases(settings)[1:]
     for side_db, relative in side_databases:
         if not side_db.is_file():
             continue
@@ -532,6 +596,7 @@ def create_backup(
             "path": relative,
             "kind": "side_db",
             "package_path": relative,
+            "restore_path": relative,
             "sha256": _sha256_file(side_target),
             "bytes": side_target.stat().st_size,
             "storage": "snapshot",
@@ -539,11 +604,35 @@ def create_backup(
         files.append(side_entry)
         logical += side_entry["bytes"]
 
+    research_copy = package / "research" / "research.sqlite3"
+    if research_copy.is_file():
+        with sqlite3.connect(research_copy) as research_conn:
+            tables = {str(row[0]) for row in research_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            for table in ("research_operation", "research_experiment"):
+                if table in tables and research_conn.execute(
+                    f"SELECT 1 FROM {table} WHERE status IN ('queued','running') LIMIT 1"
+                ).fetchone():
+                    raise DataError("backup_active_research", "研究任务或实验仍在运行，无法生成全域一致备份")
+
+    for index, (source, relative) in enumerate(_runtime_external_files(settings)):
+        package_path = f"runtime-files/{index:04d}/{Path(relative).name}"
+        target = _ensure_within(package, package / package_path)
+        digest = _sha256_file(source)
+        mode = _copy_file(source, target, allow_hardlink=False)
+        if _sha256_file(target) != digest:
+            raise DataError("backup_copy_mismatch", f"研究工件复制后摘要不符: {relative}")
+        files.append({"path": relative, "kind": "runtime_file", "package_path": package_path,
+                      "restore_path": relative, "sha256": digest, "bytes": target.stat().st_size,
+                      "storage": mode})
+        logical += target.stat().st_size
+
     manifest = {
         "format": BACKUP_FORMAT,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "database": {
             "relative_path": "app.db",
+            "restore_path": "data/app.db",
             "sha256": db_sha,
             "bytes": backup_db.stat().st_size,
             "schema_version": metadata.get("schema_version"),
@@ -555,8 +644,9 @@ def create_backup(
             "fingerprint_algorithm": "db-fingerprint-v1",
         },
         "files": files,
-        "external_expected": len(external),
+        "external_expected": len(external_refs),
         "logical_bytes": logical,
+        "consistency_policy": "offline-quiescent-v1",
         "path_mapping": "package_path is generated and validated; database paths are never used as targets",
     }
     manifest_path = package / MANIFEST_NAME
@@ -565,6 +655,7 @@ def create_backup(
     )
 
     physical, limitations = file_identity_bytes([package])
+    limitations.append(SNAPSHOT_LIMITATION)
     result = BackupResult(
         path=package,
         manifest_path=manifest_path,
@@ -590,10 +681,42 @@ def create_backup(
     return result
 
 
+def create_backup(
+    settings,
+    *,
+    out_dir: Path | None = None,
+    verify: bool = True,
+    held_writer_locks: set[Path] | None = None,
+) -> BackupResult:
+    """Create one quiescent snapshot of all extant runtime databases."""
+    databases = _runtime_databases(settings)
+    with ExitStack() as locks:
+        held = {Path(path).resolve() for path in (held_writer_locks or set())}
+        present = {path.resolve() for path, _ in databases if path.is_file()}
+        for path in sorted(present - held, key=lambda item: os.path.normcase(str(item))):
+            conn = sqlite3.connect(str(path), timeout=30.0, isolation_level=None)
+            locks.callback(conn.close)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.Error as exc:
+                raise DataError("backup_quiescence_unavailable", f"无法冻结数据库写入 {path}: {exc}") from exc
+        result = _create_backup_impl(settings, out_dir=out_dir, verify=verify)
+        if {path.resolve() for path, _ in databases if path.is_file()} != present:
+            raise DataError("backup_quiescence_unavailable", "备份期间产品数据库集合发生变化")
+        return result
+
+
 def _manifest_files(manifest: dict[str, Any]) -> list[dict[str, Any]]:
-    files = list(manifest.get("files", []))
-    external = [entry for entry in files if entry.get("kind") != "side_db"]
-    if len(external) != int(manifest.get("external_expected", len(external))):
+    raw_files = manifest.get("files", [])
+    if not isinstance(raw_files, list):
+        raise DataError("backup_manifest_mismatch", "manifest files 必须为列表")
+    files = list(raw_files)
+    external = [entry for entry in files if entry.get("kind") in {"raw", "archive"}]
+    try:
+        expected = int(manifest.get("external_expected", len(external)))
+    except (TypeError, ValueError) as exc:
+        raise DataError("backup_manifest_mismatch", "manifest 外部文件数量无效") from exc
+    if len(external) != expected:
         raise DataError("backup_manifest_mismatch", "manifest 外部文件数量与登记不一致")
     return files
 
@@ -606,10 +729,26 @@ def verify_backup(package: Path) -> dict[str, Any]:
         return {"verified": False, "reason": "manifest_missing"}
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or manifest.get("format") not in ({BACKUP_FORMAT} | LEGACY_BACKUP_FORMATS):
+            return {"verified": False, "reason": "backup_format_unsupported"}
+        raw_files = manifest.get("files", [])
+        if not isinstance(raw_files, list) or any(not isinstance(entry, dict) for entry in raw_files):
+            return {"verified": False, "reason": "manifest_invalid:files"}
         files = _manifest_files(manifest)
-    except (OSError, ValueError, DataError) as exc:
+        allowed_kinds = {"raw", "archive", "side_db", "runtime_file"}
+        if any(entry.get("kind") not in allowed_kinds for entry in files):
+            return {"verified": False, "reason": "manifest_invalid:kind"}
+    except (OSError, TypeError, ValueError, DataError) as exc:
         return {"verified": False, "reason": f"manifest_invalid:{exc}"}
-    db = package / manifest["database"]["relative_path"]
+    database = manifest.get("database")
+    if not isinstance(database, dict):
+        return {"verified": False, "reason": "manifest_invalid:database"}
+    if not isinstance(database.get("sha256"), str) or not isinstance(database.get("instance_id"), str):
+        return {"verified": False, "reason": "manifest_invalid:database_fields"}
+    try:
+        db = _ensure_within(package, package / _safe_relative(database.get("relative_path")))
+    except DataError as exc:
+        return {"verified": False, "reason": f"manifest_invalid:{exc.reason}"}
     if not db.is_file():
         return {"verified": False, "reason": "database_missing"}
     if _sha256_file(db) != manifest["database"]["sha256"]:
@@ -634,17 +773,34 @@ def verify_backup(package: Path) -> dict[str, Any]:
             return {"verified": False, "reason": "database_unreadable"}
         finally:
             conn.close()
+        seen_restore_paths = {"data/app.db"}
         for entry in files:
             package_path = str(entry.get("package_path") or "")
-            if not package_path or package_path.startswith(("/", "\\")) or ".." in Path(package_path).parts:
+            try:
+                relative_package = _safe_relative(package_path)
+                source = _ensure_within(package, package / relative_package)
+                target = _ensure_within(tmp_root, tmp_root / relative_package)
+                if manifest.get("format") == BACKUP_FORMAT:
+                    restore_relative = _safe_relative(entry.get("restore_path"))
+                elif entry.get("kind") in {"raw", "archive"}:
+                    stored = str(entry.get("path") or "")
+                    _safe_relative(stored)
+                    restore_relative = Path("data/raw" if entry["kind"] == "raw" else "archives") / stored
+                else:
+                    restore_relative = _safe_relative(entry.get("path") or package_path)
+                if restore_relative.as_posix().casefold() in seen_restore_paths:
+                    return {"verified": False, "reason": "manifest_invalid:restore_path_duplicate"}
+                seen_restore_paths.add(restore_relative.as_posix().casefold())
+            except DataError:
                 return {"verified": False, "reason": f"unsafe_package_path:{package_path}"}
-            source = package / package_path
-            target = tmp_root / package_path
+            expected_sha = entry.get("sha256")
+            if not isinstance(expected_sha, str) or len(expected_sha) != 64:
+                return {"verified": False, "reason": f"manifest_invalid:sha256:{package_path}"}
             target.parent.mkdir(parents=True, exist_ok=True)
             if not source.is_file():
                 return {"verified": False, "reason": f"file_missing:{package_path}"}
             shutil.copy2(source, target)
-            if _sha256_file(target) != entry["sha256"]:
+            if _sha256_file(target) != expected_sha:
                 return {"verified": False, "reason": f"file_mismatch:{package_path}"}
             if entry.get("kind") == "side_db":
                 try:
@@ -666,7 +822,7 @@ def verify_backup(package: Path) -> dict[str, Any]:
 
 
 def restore_package(package: Path, target_dir: Path) -> dict[str, Any]:
-    """把已验证的备份包恢复到新目录；不覆盖已有数据库。"""
+    """Restore a verified package as a complete, default-configured runtime directory."""
     package = Path(package)
     target_dir = Path(target_dir)
     verification = verify_backup(package)
@@ -674,52 +830,61 @@ def restore_package(package: Path, target_dir: Path) -> dict[str, Any]:
         raise DataError("backup_verification_failed", f"备份包未通过验证: {verification.get('reason')}")
     manifest = json.loads((package / MANIFEST_NAME).read_text(encoding="utf-8"))
     files = _manifest_files(manifest)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target_db = target_dir / "app.db"
-    if target_db.exists():
-        raise DataError("restore_target_exists", f"目标数据库已存在，拒绝覆盖: {target_db}")
-    target_root = target_dir.resolve()
+    database = manifest["database"]
+    if manifest.get("format") == BACKUP_FORMAT:
+        db_restore = _safe_relative(database.get("restore_path"))
+    else:
+        # v1 bundles were valid snapshots but restored into a non-runnable layout.
+        # Preserve their data while mapping them into the current default runtime.
+        db_restore = Path("data/app.db")
+    restore_rows: list[tuple[dict[str, Any], Path, Path]] = []
+    seen_targets = {db_restore.as_posix()}
     for entry in files:
-        package_path = str(entry.get("package_path") or "")
-        if not package_path or package_path.startswith(("/", "\\")) or ".." in Path(package_path).parts:
-            raise DataError("backup_path_escape", f"不安全的包内路径: {package_path}")
-        target = (target_root / package_path).resolve()
-        try:
-            target.relative_to(target_root)
-        except ValueError as exc:
-            raise DataError("backup_path_escape", f"恢复路径逃逸: {package_path}") from exc
-        if target.exists():
-            raise DataError("restore_target_exists", f"恢复目标已存在，拒绝覆盖: {target}")
-    shutil.copy2(package / "app.db", target_db)
-    restored = 0
-    for entry in files:
-        if entry.get("kind") == "side_db":
-            continue
-        package_path = str(entry["package_path"])
-        if package_path.startswith(("/", "\\")) or ".." in Path(package_path).parts:
-            raise DataError("backup_path_escape", f"不安全的包内路径: {package_path}")
-        source = package / package_path
-        target = target_dir / package_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-        if _sha256_file(target) != entry["sha256"]:
-            raise DataError("restore_copy_mismatch", f"恢复后摘要不符: {package_path}")
-        restored += 1
-    for entry in files:
-        if entry.get("kind") != "side_db":
-            continue
-        package_path = str(entry["package_path"])
-        if package_path.startswith(("/", "\\")) or ".." in Path(package_path).parts:
-            raise DataError("backup_path_escape", f"不安全的侧库包内路径: {package_path}")
-        source = package / package_path
-        target = target_dir / package_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-        if _sha256_file(target) != entry["sha256"]:
-            raise DataError("restore_copy_mismatch", f"恢复后摘要不符: {package_path}")
+        package_rel = _safe_relative(entry.get("package_path"))
+        if manifest.get("format") == BACKUP_FORMAT:
+            restore_rel = _safe_relative(entry.get("restore_path"))
+        elif entry.get("kind") in {"raw", "archive"}:
+            stored = str(entry.get("path") or "")
+            _safe_relative(stored)
+            restore_rel = Path("data/raw" if entry["kind"] == "raw" else "archives") / stored
+        else:
+            restore_rel = _safe_relative(entry.get("path") or entry.get("package_path"))
+        key = restore_rel.as_posix().casefold()
+        if key in seen_targets:
+            raise DataError("backup_manifest_mismatch", f"多个备份项写入同一恢复路径: {restore_rel}")
+        seen_targets.add(key)
+        restore_rows.append((entry, package_rel, restore_rel))
+
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    if target_dir.exists():
+        raise DataError("restore_target_exists", f"拒绝覆盖已有恢复目录: {target_dir}")
+    # Keep the temporary sibling short for Windows MAX_PATH-limited copies.
+    stage = target_dir.parent / f".restore-{uuid.uuid4().hex[:12]}"
+    stage.mkdir(parents=False, exist_ok=False)
+    target_db = stage / db_restore
+    try:
+        source_db = _ensure_within(package, package / _safe_relative(database.get("relative_path")))
+        target_db.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_db, target_db)
+        if _sha256_file(target_db) != database["sha256"]:
+            raise DataError("restore_copy_mismatch", "恢复主数据库摘要不符")
+        restored = 0
+        for entry, package_rel, restore_rel in restore_rows:
+            source = _ensure_within(package, package / package_rel)
+            target = _ensure_within(stage, stage / restore_rel)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            if _sha256_file(target) != entry["sha256"]:
+                raise DataError("restore_copy_mismatch", f"恢复后摘要不符: {restore_rel}")
+            if entry.get("kind") in {"raw", "archive", "runtime_file"}:
+                restored += 1
+        os.replace(stage, target_dir)
+    except Exception:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
     return {
         "status": "restored",
-        "database": str(target_db),
+        "database": str(target_dir / db_restore),
         "external_files": restored,
         "target_dir": str(target_dir),
     }

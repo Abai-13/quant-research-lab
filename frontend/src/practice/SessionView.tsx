@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import "./practice-session.css";
 
 import type {
@@ -107,8 +107,35 @@ export function SessionView({
 }) {
   const [hideSystem, setHideSystem] = useState(Boolean(session.settings.hide_system_hints));
   const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null);
+  const advanceTriggerRef = useRef<HTMLButtonElement>(null);
+  const finishTriggerRef = useRef<HTMLButtonElement>(null);
+  const restartTriggerRef = useRef<HTMLButtonElement>(null);
   const [marketQuery, setMarketQuery] = useState("");
   const finished = isFinished(session.status);
+
+  function closeConfirmation() {
+    const trigger = confirmAction === "advance"
+      ? advanceTriggerRef.current
+      : confirmAction === "finish"
+        ? finishTriggerRef.current
+        : restartTriggerRef.current;
+    setConfirmAction(null);
+    window.requestAnimationFrame(() => trigger?.focus());
+  }
+
+  useEffect(() => {
+    if (!confirmAction) {
+      return;
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeConfirmation();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [confirmAction]);
 
   useEffect(() => {
     setHideSystem(Boolean(session.settings.hide_system_hints));
@@ -181,6 +208,7 @@ export function SessionView({
             type="button"
             className="link-button"
             disabled={Boolean(busy)}
+            ref={restartTriggerRef}
             onClick={() => setConfirmAction("restart")}
           >
             重新创建模拟
@@ -407,6 +435,7 @@ export function SessionView({
                 type="button"
                 className="practice-primary"
                 disabled={finished || Boolean(busy) || !session.next_trade_date}
+                ref={advanceTriggerRef}
                 onClick={() => setConfirmAction("advance")}
               >
                 {session.next_trade_date
@@ -417,6 +446,7 @@ export function SessionView({
                 type="button"
                 className="refresh-button"
                 disabled={finished || Boolean(busy)}
+                ref={finishTriggerRef}
                 onClick={() => setConfirmAction("finish")}
               >
                 结束模拟并生成复盘
@@ -438,7 +468,7 @@ export function SessionView({
             <button type="button" className="practice-primary" disabled={Boolean(busy)} onClick={handleAdvance}>
               确认揭晓
             </button>
-            <button type="button" className="link-button" onClick={() => setConfirmAction(null)}>
+            <button type="button" className="link-button" onClick={closeConfirmation}>
               取消
             </button>
           </div>
@@ -460,7 +490,7 @@ export function SessionView({
             >
               确认结束
             </button>
-            <button type="button" className="link-button" onClick={() => setConfirmAction(null)}>
+            <button type="button" className="link-button" onClick={closeConfirmation}>
               取消
             </button>
           </div>
@@ -482,7 +512,7 @@ export function SessionView({
             >
               确认重开
             </button>
-            <button type="button" className="link-button" onClick={() => setConfirmAction(null)}>
+            <button type="button" className="link-button" onClick={closeConfirmation}>
               取消
             </button>
           </div>

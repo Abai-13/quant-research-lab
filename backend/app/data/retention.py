@@ -1250,7 +1250,12 @@ def apply_cleanup(
                 # 恢复保障先于任何删除：默认新建并验证；显式替代恢复点必须能证明
                 # 它就是本库操作前的状态（实例 + 路径 + 完整内容指纹）。
                 if create_recovery_point:
-                    backup = create_backup(settings, verify=True)
+                    # Reuse the transaction's existing BEGIN IMMEDIATE reservation.
+                    # No main-DB writes have occurred yet, so an independent SQLite
+                    # backup connection observes the exact committed state validated
+                    # above while the writer lock remains held through cleanup.
+                    backup = create_backup(settings, verify=True,
+                                           held_writer_locks={Path(settings.db_path)})
                     recovery = validate_recovery_point(
                         settings, backup.path, current_conn=conn
                     )
