@@ -10,6 +10,9 @@ import type {
   OrderPreview,
   PracticeDecision,
   PracticeOptions,
+  PracticePlan,
+  PlanPayload,
+  PracticeSessionWorkspace,
   PracticeOrder,
   PracticePosition,
   PracticeReport,
@@ -513,6 +516,8 @@ export function normalizeOptions(raw: unknown): PracticeOptions {
       data_version_id: text(defaults.data_version_id),
       source_code: text(defaults.source_code),
       name: text(defaults.name),
+      cash_cents: integerOrNull(defaults.cash_cents),
+      watchlist_symbols: asArray(defaults.watchlist_symbols).filter((item): item is string => typeof item === "string"),
     },
     demo_available: record.demo_available === undefined ? true : bool(record.demo_available),
     limitations: textList(record.limitations),
@@ -584,6 +589,89 @@ export async function createPractice(input: CreatePracticeInput): Promise<Practi
   });
   const record = isRecord(raw) ? raw : {};
   return normalizeSession(record.session ?? raw);
+}
+
+function normalizePlan(raw: unknown): PracticePlan {
+  const record = isRecord(raw) && isRecord(raw.plan) ? raw.plan : raw;
+  if (!isRecord(record) || typeof record.plan_id !== "string" || !isRecord(record.payload)) {
+    throw new PracticeApiError("服务返回的方案格式无效。", "invalid_response", 200, null);
+  }
+  const qualification = isRecord(record.qualification) ? record.qualification : {};
+  return {
+    plan_id: record.plan_id,
+    version: integerOrNull(record.version) ?? 0,
+    status: record.status === "confirmed" ? "confirmed" : "draft",
+    payload: record.payload as unknown as PlanPayload,
+    symbols: asArray(record.symbols).filter((item): item is string => typeof item === "string"),
+    goal: text(record.goal) ?? "",
+    practice_id: text(record.practice_id),
+    created_at: text(record.created_at) ?? "",
+    updated_at: text(record.updated_at) ?? "",
+    qualification: {
+      ready: bool(qualification.ready),
+      issues: asArray(qualification.issues).flatMap((item) => {
+        if (!isRecord(item)) return [];
+        return [{ code: text(item.code) ?? "unknown", detail: text(item.detail) ?? "服务端未提供详情" }];
+      }),
+      limitations: textList(qualification.limitations),
+      start_date: text(qualification.start_date),
+      end_date: text(qualification.end_date),
+    },
+  };
+}
+
+export async function fetchPracticePlan(planId: string, version?: number): Promise<PracticePlan> {
+  const query = version === undefined ? "" : `?version=${encodeURIComponent(String(version))}`;
+  return normalizePlan(await request<unknown>(`/api/practice/plans/${encodeURIComponent(planId)}${query}`));
+}
+
+export async function savePracticePlan(input: {
+  payload: PlanPayload; symbols: string[]; goal: string; idempotency_key: string;
+}): Promise<PracticePlan> {
+  return normalizePlan(await request<unknown>("/api/practice/plans", {
+    method: "POST", body: JSON.stringify(input),
+  }));
+}
+
+export async function updatePracticePlan(planId: string, input: {
+  expected_version: number; payload: PlanPayload; symbols: string[]; goal: string; idempotency_key: string;
+}): Promise<PracticePlan> {
+  return normalizePlan(await request<unknown>(`/api/practice/plans/${encodeURIComponent(planId)}`, {
+    method: "PUT", body: JSON.stringify(input),
+  }));
+}
+
+export async function confirmPracticePlan(planId: string, expectedVersion: number, idempotencyKey: string): Promise<{ plan: PracticePlan; session: PracticeView }> {
+  const raw = await request<unknown>(`/api/practice/plans/${encodeURIComponent(planId)}/confirm`, {
+    method: "POST", body: JSON.stringify({ expected_version: expectedVersion, idempotency_key: idempotencyKey }),
+  });
+  const record = isRecord(raw) ? raw : {};
+  return { plan: normalizePlan(record.plan), session: normalizeSession(record.session) };
+}
+
+export async function fetchSessionWorkspace(practiceId: string): Promise<PracticeSessionWorkspace> {
+  const raw = await request<unknown>(`/api/practice/sessions/${encodeURIComponent(practiceId)}/workspace`);
+  const record = isRecord(raw) ? raw : {};
+  const source = normalizeSource(record.source);
+  return {
+    practice_id: text(record.practice_id) ?? practiceId,
+    revision: integerOrNull(record.revision) ?? 0,
+    as_of: text(record.as_of),
+    next_trade_date: text(record.next_trade_date),
+    source,
+    rows: asArray(record.rows).flatMap((item) => {
+      if (!isRecord(item) || !text(item.ts_code)) return [];
+      return [{
+        ts_code: text(item.ts_code)!, name: text(item.name) ?? "",
+        price_cents: integerOrNull(item.price_cents), price_date: text(item.price_date),
+        change_bps: integerOrNull(item.change_bps), change_base_date: text(item.change_base_date), shares: integerOrNull(item.shares),
+        sellable_shares: integerOrNull(item.sellable_shares),
+        market_value_cents: integerOrNull(item.market_value_cents), pnl_cents: integerOrNull(item.pnl_cents),
+        last_agent_action: text(item.last_agent_action),
+      }];
+    }),
+    limitations: textList(record.limitations),
+  };
 }
 
 export async function fetchSession(practiceId: string): Promise<PracticeView> {

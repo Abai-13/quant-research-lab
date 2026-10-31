@@ -1,313 +1,89 @@
 import { useState } from "react";
 
-import type {
-  CreatePracticeInput,
-  DemoPreparation,
-  PracticeOptions,
-  PracticeSummary,
-} from "./types";
+import type { CreatePracticeInput, DemoPreparation, PracticeOptions, PracticePlan, PracticeSummary, PlanPayload } from "./types";
+import type { PracticeSection } from "./PracticeWorkspace";
 import { formatDate, isFinished } from "./format";
 import { NewPracticeForm } from "./NewPracticeForm";
-import { EmptyState, Notice, SectionHeading, StatusBadge, sourceLabel, type Tone } from "./ui";
+import { EmptyState, Notice, StatusBadge, sourceLabel, type Tone } from "./ui";
 import { AgentPanel } from "./AgentPanel";
-import { DataPreparation } from "../phase6/DataPreparation";
-import type { PreparedDataset } from "../phase6/types";
 
 function summaryMeta(session: PracticeSummary): string {
-  const parts = [formatDate(session.start_date), formatDate(session.end_date)];
-  if (session.revealed_date) {
-    parts.push(`已揭晓至 ${formatDate(session.revealed_date)}`);
-  }
-  return parts.join(" · ");
+  return [formatDate(session.start_date), formatDate(session.end_date), session.revealed_date ? `已揭晓至 ${formatDate(session.revealed_date)}` : null].filter(Boolean).join(" · ");
 }
 
 export function HomeView({
-  options,
-  optionsError,
-  sessions,
-  sessionsLoading,
-  sessionsError,
-  demo,
-  demoBusy,
-  creating,
-  busy,
-  lastSessionId,
-  notice,
-  onDismissNotice,
-  onCreate,
-  onPrepareDemo,
-  onOpen,
-  onRestart,
-  onRefreshSessions,
-  onReloadOptions,
+  section, options, optionsError, sessions, sessionsLoading, sessionsError, lastSessionId, demo, demoBusy, creating,
+  plan, planBusy, setupDraft, notice, onDismissNotice, onCreate, onSavePlan, onConfirmPlan,
+  onApplySetupDraft, onSetupDraftConsumed, onPrepareDemo, onOpen, onRestart, onRefreshSessions, onReloadOptions, onNavigate, onGoControl,
 }: {
+  section: PracticeSection;
   options: PracticeOptions | null;
   optionsError: string | null;
   sessions: PracticeSummary[];
   sessionsLoading: boolean;
   sessionsError: string | null;
+  lastSessionId?: string | null;
   demo: DemoPreparation | null;
   demoBusy: boolean;
   creating: boolean;
-  busy: boolean;
-  lastSessionId: string | null;
+  plan: PracticePlan | null;
+  planBusy: boolean;
+  setupDraft: Record<string, unknown> | null;
   notice: { tone: Tone; text: string } | null;
   onDismissNotice: () => void;
   onCreate: (input: CreatePracticeInput) => Promise<void>;
+  onSavePlan: (payload: PlanPayload, symbols: string[], goal: string, key: string) => Promise<void>;
+  onConfirmPlan: () => Promise<void>;
+  onApplySetupDraft: (payload: Record<string, unknown>) => void;
+  onSetupDraftConsumed?: () => void;
   onPrepareDemo: () => Promise<void>;
   onOpen: (practiceId: string) => void;
   onRestart: (practiceId: string) => Promise<void>;
   onRefreshSessions: () => void;
   onReloadOptions: () => void;
+  onNavigate?: (section: PracticeSection) => void;
+  onGoControl?: () => void;
 }) {
-  const [restartTarget, setRestartTarget] = useState<PracticeSummary | null>(null);
-  const [setupDraft, setSetupDraft] = useState<Record<string, unknown> | null>(null);
-  const [setupDraftOrigin, setSetupDraftOrigin] = useState<string | null>(null);
-  const [dataPreparationOpen, setDataPreparationOpen] = useState(false);
+  const [restartTarget, setRestartTarget] = useState<string | null>(null);
   const runningCount = sessions.filter((session) => !isFinished(session.status)).length;
-  const lastSession =
-    sessions.find((session) => session.practice_id === lastSessionId) ?? sessions[0] ?? null;
-  const isResume = lastSession !== null && lastSession.practice_id === lastSessionId;
+  const lastSession = sessions.find((session) => session.practice_id === lastSessionId) ?? sessions[0] ?? null;
 
-  function openDataPreparation() {
-    setDataPreparationOpen(true);
-    window.setTimeout(() => {
-      const summary = document.getElementById("data-prepare-summary");
-      summary?.scrollIntoView({ behavior: "smooth", block: "start" });
-      summary?.focus();
-    }, 0);
-  }
-
-  return (
-    <div className="practice-home">
+  return <div className="practice-home">
+    {section === "home" ? <>
       <section className="practice-hero">
         <div className="practice-hero-copy">
-          <p className="eyebrow">历史模拟工作台</p>
-          <h1>开始一段历史模拟，或继续上次进度</h1>
-          <p className="practice-hero-lead">
-            第一次使用可以先体验合成示例，也可以准备服务端支持的历史数据。创建后按当时可见行情操作并逐日揭晓；不接入真实资金。
-          </p>
+          <p className="eyebrow">Agent 投资练习 · 历史数据模拟</p>
+          <h1>先说目标，再检查方案</h1>
+          <p className="practice-hero-lead">选择本地演示或可用数据，和 Agent 一起整理方案；资格检查通过后，由你确认创建。不会接入真实资金。</p>
           <div className="practice-hero-actions">
-            {lastSession ? (
-              <button
-                type="button"
-                className="practice-primary"
-                disabled={busy}
-                onClick={() => onOpen(lastSession.practice_id)}
-              >
-                {isResume ? "继续上次模拟" : "继续最近模拟"}
-              </button>
-            ) : null}
-            <a className="practice-secondary-link" href="#new-practice-heading">
-              创建模拟
-            </a>
+            <button type="button" className="practice-primary" onClick={() => void onPrepareDemo()} disabled={demoBusy || options?.demo_available === false}>{demoBusy ? "正在准备…" : "带我体验一次"}</button>
+            {lastSession ? <button type="button" className="practice-secondary" onClick={() => onOpen(lastSession.practice_id)}>继续上次练习</button> : null}
+            <button type="button" className="practice-secondary" onClick={() => onNavigate?.("records")}>查看练习记录 · {sessions.length}</button>
           </div>
+          {demo ? <p className="practice-field-hint">演示范围已由服务端准备：{formatDate(demo.startDate)} 至 {formatDate(demo.endDate)}。准备不会创建练习。</p> : <p className="practice-field-hint">无模型也可手动完成方案、下单、推进和复盘。</p>}
         </div>
-        <dl className="practice-hero-stats">
-          <div>
-            <dt>模拟记录</dt>
-            <dd>{sessions.length}</dd>
-          </div>
-          <div>
-            <dt>进行中</dt>
-            <dd>{runningCount}</dd>
-          </div>
-          <div>
-            <dt>已完成</dt>
-            <dd>{sessions.length - runningCount}</dd>
-          </div>
-        </dl>
+        <dl className="practice-hero-stats"><div><dt>练习记录</dt><dd>{sessions.length}</dd></div><div><dt>进行中</dt><dd>{runningCount}</dd></div><div><dt>已完成</dt><dd>{sessions.length - runningCount}</dd></div></dl>
       </section>
-
-      <section className="practice-start-choices" aria-label="选择开始方式">
-        <a href="#new-practice-heading">
-          <span className="eyebrow">第一次体验</span>
-          <strong>体验合成示例</strong>
-          <span>使用明确标记的离线样本，不需要模型或服务商凭据。</span>
-        </a>
-        <button type="button" onClick={openDataPreparation}>
-          <span className="eyebrow">已有数据来源</span>
-          <strong>准备历史数据</strong>
-          <span>先查看支持来源、日期范围与资格，再由你选择是否准备。</span>
-        </button>
-      </section>
-
-      {notice ? (
-        <Notice tone={notice.tone} onDismiss={onDismissNotice}>
-          {notice.text}
-        </Notice>
-      ) : null}
-
-      {optionsError ? (
-        <Notice tone="warn" title="数据选项暂不可用">
-          <p>{optionsError}</p>
-          <div className="practice-notice-actions">
-            <button type="button" className="refresh-button" onClick={onReloadOptions}>
-              重新读取数据选项
-            </button>
-          </div>
-        </Notice>
-      ) : null}
-
-      <NewPracticeForm
-        options={options}
-        demo={demo}
-        demoBusy={demoBusy}
-        creating={creating}
-        onCreate={onCreate}
-        onPrepareDemo={onPrepareDemo}
-        setupDraft={setupDraft}
-      />
-
-      {setupDraftOrigin ? <Notice tone="neutral" title={`${setupDraftOrigin}已填入创建表单`}>
-        <p>请核对日期、资金、数据版本和持仓，再手动确认创建。</p>
-      </Notice> : null}
-
-      <details
-        className="practice-data-preparation"
-        id="data-prepare-section"
-        open={dataPreparationOpen}
-        onToggle={(event) => setDataPreparationOpen(event.currentTarget.open)}
-      >
-        <summary id="data-prepare-summary">高级数据准备 <span>选择服务端支持的来源、区间并查看数据资格</span></summary>
-        <p className="practice-field-hint practice-data-preparation-note">
-          这里调用独立的数据准备流程，生成的是数据集样本，不等同于上方的内置模拟演示。合成样本也可能受资格或行情范围限制；能否创建和成交以服务端结果及模拟规则为准。
-        </p>
-        <DataPreparation onUseDataset={(dataset: PreparedDataset) => {
-          const weekday = (value: string, direction: 1 | -1) => {
-            const date = new Date(`${value}T00:00:00Z`);
-            while (date.getUTCDay() === 0 || date.getUTCDay() === 6) date.setUTCDate(date.getUTCDate() + direction);
-            return date.toISOString().slice(0, 10);
-          };
-          const startDate = dataset.synthetic ? weekday(dataset.start_date, 1) : dataset.start_date;
-          const endDate = dataset.synthetic ? weekday(dataset.end_date, -1) : dataset.end_date;
-          setSetupDraft({ name: dataset.synthetic ? "合成示例模拟" : "历史数据模拟", start_date: startDate, end_date: endDate, source_code: dataset.source_code, data_version_id: dataset.data_version_id });
-          const sourceName = options?.sources.find((source) => source.code === dataset.source_code)?.label;
-          setSetupDraftOrigin(`${dataset.synthetic ? "Stage 6 受限合成数据样本" : "历史数据集"}${sourceName ? ` · ${sourceName}` : ""}`);
-          onReloadOptions();
-          window.setTimeout(() => document.getElementById("new-practice-heading")?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
-        }} />
-      </details>
-      <AgentPanel onSetupDraft={(payload) => {
-        setSetupDraft(payload);
-        setSetupDraftOrigin("Agent 条件草稿");
-        window.setTimeout(() => document.getElementById("new-practice-heading")?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
-      }} />
-
-      <section className="practice-steps" aria-label="历史模拟流程">
-        <div>
-          <span className="practice-step-number">1</span>
-          <p>创建模拟并设定起点</p>
+      {notice ? <Notice tone={notice.tone} onDismiss={onDismissNotice}>{notice.text}</Notice> : null}
+      {optionsError ? <Notice tone="warn" title="数据选项暂不可用"><p>{optionsError}</p><button type="button" className="refresh-button" onClick={onReloadOptions}>重新读取数据选项</button></Notice> : null}
+      {!options ? <Notice tone="neutral">正在读取真实数据范围与默认值。准备演示或后端选项不可用时，不会用假日期和证券替代。</Notice> : null}
+      <div className="practice-entry-grid">
+        <div className="practice-entry-plan">
+          <NewPracticeForm options={options} demo={demo} demoBusy={demoBusy} creating={creating} plan={plan} planBusy={planBusy} setupDraft={setupDraft} onSetupDraftConsumed={onSetupDraftConsumed} onCreate={onCreate} onSavePlan={onSavePlan} onConfirmPlan={onConfirmPlan} onPrepareDemo={onPrepareDemo} />
         </div>
-        <div>
-          <span className="practice-step-number">2</span>
-          <p>查看已揭晓行情并下单</p>
-        </div>
-        <div>
-          <span className="practice-step-number">3</span>
-          <p>逐日揭晓、对照三路曲线</p>
-        </div>
-        <div>
-          <span className="practice-step-number">4</span>
-          <p>结束并查看模拟报告</p>
-        </div>
-      </section>
-
-      <section className="section" aria-labelledby="history-heading">
-        <SectionHeading
-          id="history-heading"
-          title="历史模拟"
-          actions={
-            <button type="button" className="refresh-button" onClick={onRefreshSessions} disabled={sessionsLoading}>
-              {sessionsLoading ? "读取中…" : "刷新列表"}
-            </button>
-          }
-        >
-          每段模拟都有独立身份；重开会创建新的模拟，旧记录与模拟报告继续保留。
-        </SectionHeading>
-
-        {sessionsError ? (
-          <Notice tone="error" title="读取历史模拟失败">
-            {sessionsError}
-          </Notice>
-        ) : null}
-
-        {sessionsLoading && sessions.length === 0 ? (
-          <div className="empty-state">
-            <p className="empty-title">正在读取模拟记录…</p>
-          </div>
-        ) : sessions.length === 0 ? (
-          <EmptyState title="还没有历史模拟">
-            用上方表单创建第一段历史模拟。没有数据时可先准备合成示例，不会写入真实数据。
-          </EmptyState>
-        ) : (
-          <div className="practice-session-list">
-            {sessions.map((session) => (
-              <article className="practice-session-row" key={session.practice_id}>
-                <div className="practice-session-main">
-                  <div className="practice-session-title">
-                    <h3>{session.name}</h3>
-                    <StatusBadge status={session.status} />
-                    {session.source?.synthetic ? (
-                      <span className="chip chip-warn">
-                        <span className="chip-dot" aria-hidden="true" />
-                        合成示例
-                      </span>
-                    ) : null}
-                  </div>
-                  <p className="muted">{summaryMeta(session)}</p>
-                  <p className="muted">来源：{sourceLabel(session.source)}</p>
-                </div>
-                <div className="practice-session-actions">
-                  <button
-                    type="button"
-                    className="refresh-button"
-                    disabled={busy}
-                    onClick={() => onOpen(session.practice_id)}
-                  >
-                    {isFinished(session.status) ? "查看模拟报告" : "继续模拟"}
-                  </button>
-                  <button
-                    type="button"
-                    className="link-button"
-                    disabled={busy}
-                    onClick={() => setRestartTarget(session)}
-                  >
-                    重新创建
-                  </button>
-                </div>
-                {restartTarget?.practice_id === session.practice_id ? (
-                  <div className="practice-confirm" role="group" aria-label="确认重新创建模拟">
-                    <p>
-                      将基于同一段设置创建一个新的模拟身份，旧记录与报告会保留。确认继续吗？
-                    </p>
-                    <div className="practice-confirm-actions">
-                      <button
-                        type="button"
-                        className="practice-primary"
-                        disabled={busy}
-                        onClick={() => {
-                          const target = restartTarget;
-                          setRestartTarget(null);
-                          if (target) {
-                            void onRestart(target.practice_id);
-                          }
-                        }}
-                      >
-                        确认重新创建
-                      </button>
-                      <button type="button" className="link-button" onClick={() => setRestartTarget(null)}>
-                        取消
-                      </button>
-                    </div>
-                  </div>
-                ) : null}
-              </article>
-            ))}
-          </div>
-        )}
-      </section>
-
-    </div>
-  );
+        <div className="practice-entry-agent"><AgentPanel planId={plan?.status === "draft" ? plan.plan_id : null} planVersion={plan?.status === "draft" ? plan.version : null} onSetupDraft={onApplySetupDraft} onGoControl={onGoControl} /></div>
+      </div>
+    </> : <>
+      <header className="practice-session-header"><div><p className="eyebrow">练习记录</p><h1>你的练习</h1><p className="practice-hero-lead">打开记录可继续练习或查看真实复盘报告。</p></div><button type="button" className="refresh-button" onClick={onRefreshSessions} disabled={sessionsLoading}>{sessionsLoading ? "读取中…" : "刷新记录"}</button></header>
+      {notice ? <Notice tone={notice.tone} onDismiss={onDismissNotice}>{notice.text}</Notice> : null}
+      {sessionsError ? <Notice tone="error" title="读取练习记录失败">{sessionsError}</Notice> : null}
+      {sessionsLoading && sessions.length === 0 ? <EmptyState title="正在读取练习记录…" /> : sessions.length === 0 ? <EmptyState title="还没有练习记录">返回首页，先准备本地演示或选择可用数据。</EmptyState> : <div className="practice-session-list">
+        {sessions.map((session) => <article className="practice-session-row" key={session.practice_id}>
+          <div className="practice-session-main"><div className="practice-session-title"><h2>{session.name}</h2><StatusBadge status={session.status} /></div><p className="muted">{summaryMeta(session)}</p><p className="muted">来源：{sourceLabel(session.source)}</p></div>
+          <div className="practice-session-actions"><button type="button" className="practice-primary" onClick={() => onOpen(session.practice_id)}>{isFinished(session.status) ? "查看练习与复盘" : "继续练习"}</button><button type="button" className="link-button" disabled={Boolean(restartTarget)} onClick={() => setRestartTarget(session.practice_id)}>重新开始</button></div>
+          {restartTarget === session.practice_id ? <div className="practice-confirm" role="group" aria-label="确认重新开始"><p>将依据该记录创建一个新的练习身份；这条记录与原报告会保留。</p><div className="practice-confirm-actions"><button type="button" className="practice-primary" onClick={() => { setRestartTarget(null); void onRestart(session.practice_id); }}>确认重新开始</button><button type="button" className="link-button" onClick={() => setRestartTarget(null)}>取消</button></div></div> : null}
+        </article>)}
+      </div>}
+    </>}
+  </div>;
 }

@@ -129,6 +129,7 @@ def _install_demo_seed(target: sqlite3.Connection, seeded: dict[str, Any]) -> di
                 "kind": "explicit_practice_synthetic_demo",
                 "seed_version_id": data_version_id,
                 "simulation_rule_bundle_id": str(seeded["simulation_rule_bundle_id"]),
+                "parameter_bundle_id": str(seeded["parameter_bundle_id"]),
             },
             categories=categories,
             rule_version=str(source_meta[1]),
@@ -220,8 +221,62 @@ def _explicit_demo_rule_bundle(conn: sqlite3.Connection, version_id: str, source
     return bundle_id
 
 
+def _explicit_demo_parameter_bundle(conn, version_id, source_code):
+    if source_code != "tushare-fixture": return None
+    row = conn.execute("SELECT scope FROM data_version WHERE version_id=? AND source_code=?", (version_id, source_code)).fetchone()
+    scope = decode_json(row[0]) if row else {}
+    if scope.get("kind") != "explicit_practice_synthetic_demo": return None
+    bundle_id = scope.get("parameter_bundle_id")
+    bundle = load_rule_bundle(conn, bundle_id) if bundle_id else None
+    if (bundle and bundle["kind"] == "parameter" and bundle["assumption_scope"] == "synthetic_simulation"
+            and isinstance(bundle["content"].get("target_constraints"), dict)):
+        return bundle_id
+    return None
+
+
 def create_practice_router() -> APIRouter:
     router = APIRouter(prefix="/api/practice", tags=["practice"])
+
+    def place_order_transaction(conn: sqlite3.Connection, practice_id: str, body: dict[str, Any], settings: Any):
+        session = require_session(conn, practice_id)
+        replay, request_hash = idempotent_response(conn, operation=f"order:{practice_id}", key=body.get("idempotency_key"), request=body)
+        if replay is not None: return replay
+        check_revision(session, body.get("expected_revision"))
+        trade_date = next_trade_date(conn, session)
+        if trade_date is None: raise PracticeError("no_future_trade_date", "该练习区间没有下一个交易日", 409)
+        preview = order_preview(conn, session, body)
+        if preview["direction"] == "buy" and preview["cash_sufficient_at_known_price"] is False:
+            raise PracticeError("insufficient_cash", "按已揭晓价格估算的金额超过可用现金", 409)
+        order_id = str(uuid.uuid4())
+        conn.execute("INSERT INTO practice_order(order_id,practice_id,idempotency_key,trade_date,ts_code,direction,planned_shares,status,detail_json,created_at) VALUES(?,?,?,?,?,?,?,'pending',?,?)",
+                     (order_id, practice_id, body["idempotency_key"], trade_date, str(preview["ts_code"]), preview["direction"], preview["planned_shares"], "{}", utc_now()))
+        user = dict(session["user_state"])
+        user["orders"] = [*user.get("orders", []), {"order_id": order_id, "trade_date": trade_date, "ts_code": str(preview["ts_code"]), "direction": preview["direction"], "planned_shares": preview["planned_shares"], "status": "pending"}]
+        compare_and_update(conn, session, user_state=user)
+        response = {"ok": True, "session": view(conn, session, settings)}
+        save_idempotency(conn, operation=f"order:{practice_id}", key=body["idempotency_key"], request_hash=request_hash, practice_id=practice_id, response=response)
+        return response
+
+    def advance_transaction(conn: sqlite3.Connection, practice_id: str, body: dict[str, Any], settings: Any):
+        session = require_session(conn, practice_id)
+        replay, request_hash = idempotent_response(conn, operation=f"advance:{practice_id}", key=body.get("idempotency_key"), request=body)
+        if replay is not None: return replay
+        check_revision(session, body.get("expected_revision"))
+        date = next_trade_date(conn, session)
+        if date is None: raise PracticeError("no_future_trade_date", "该练习区间没有下一个交易日", 409)
+        try:
+            from app.practice.comparison import advance_paths
+        except ImportError as exc:
+            raise PracticeError("comparison_unavailable", "对照引擎尚未就绪", 503) from exc
+        result = advance_paths(conn, session, date)
+        user_state = refreshed_user_state(conn, session)
+        user_state["last_advance"] = result
+        compare_and_update(conn, session, revealed_date=date, user_state=user_state)
+        response = {"ok": True, "session": view(conn, session, settings)}
+        save_idempotency(conn, operation=f"advance:{practice_id}", key=body["idempotency_key"], request_hash=request_hash, practice_id=practice_id, response=response)
+        return response
+
+    router.practice_actions = {"order": place_order_transaction, "advance": advance_transaction}
 
     def connect(request: Request) -> sqlite3.Connection:
         return practice_connect(request.app.state.settings)
@@ -237,20 +292,39 @@ def create_practice_router() -> APIRouter:
             for row in source_rows
         ]
         symbols: list[dict[str, Any]] = []
+        coverage_start = coverage_end = None
         limitations = [
             "练习行情只读取所选数据版本；不会在普通读取请求中联网更新。",
             "历史股票池、停牌和公司行为能力取决于已发布数据版本的实际覆盖。",
         ]
-        for version in reversed(versions):
+        for version in versions:
             try:
                 view = VersionView(conn, version["version_id"], expected_source_code=version["source_code"])
             except Exception:
                 continue
-            symbols = [
-                {"ts_code": str(row["ts_code"]), "name": row["name"]}
-                for row in view.securities()
-            ]
-            break
+            calendar = view.calendar_days()
+            if view.chunked:
+                daily_rows = conn.execute(
+                    "SELECT DISTINCT m.ts_code,m.biz_date FROM data_version_chunk vc JOIN data_chunk_member m ON m.chunk_id=vc.chunk_id WHERE vc.version_id=? AND vc.category='daily'",
+                    (version["version_id"],),
+                ).fetchall()
+            else:
+                daily_rows = conn.execute(
+                    "SELECT DISTINCT ts_code,trade_date FROM daily_price WHERE source_code=?", (version["source_code"],)
+                ).fetchall()
+            visible_dates = sorted(set(calendar).intersection(str(row[1]) for row in daily_rows))
+            version["start_date"] = visible_dates[0] if visible_dates else None
+            version["end_date"] = visible_dates[-1] if visible_dates else None
+        default_version = next((item for item in reversed(versions) if item.get("start_date") and item.get("end_date")), None)
+        if default_version:
+            selected = VersionView(conn, default_version["version_id"], expected_source_code=default_version["source_code"])
+            daily_codes = {str(row[0]) for row in conn.execute(
+                "SELECT DISTINCT m.ts_code FROM data_version_chunk vc JOIN data_chunk_member m ON m.chunk_id=vc.chunk_id WHERE vc.version_id=? AND vc.category='daily'" if selected.chunked else
+                "SELECT DISTINCT ts_code FROM daily_price WHERE source_code=?", (default_version["version_id"] if selected.chunked else default_version["source_code"],)
+            ).fetchall()}
+            symbols = [{"ts_code": str(row["ts_code"]), "name": row["name"]}
+                       for row in selected.securities() if str(row["ts_code"]) in daily_codes]
+            coverage_start, coverage_end = default_version["start_date"], default_version["end_date"]
         return {
             "sources": sources,
             "versions": versions,
@@ -258,8 +332,10 @@ def create_practice_router() -> APIRouter:
             "defaults": {
                 "cash_cents": 1_000_000,
                 "rebalance_every_n_days": 5,
-                "data_version_id": versions[-1]["version_id"] if versions else None,
-                "source_code": versions[-1]["source_code"] if versions else None,
+                "data_version_id": default_version["version_id"] if default_version else (versions[-1]["version_id"] if versions else None),
+                "source_code": default_version["source_code"] if default_version else (versions[-1]["source_code"] if versions else None),
+                "start_date": coverage_start,
+                "end_date": coverage_end,
             },
             "demo_available": True,
             "limitations": limitations,
@@ -384,7 +460,7 @@ def create_practice_router() -> APIRouter:
         demo_rule_bundle_id = _explicit_demo_rule_bundle(conn, version_id, source_code)
         settings = {
             "rebalance_every_n_days": 5,
-            "parameter_bundle_id": bundles["parameter"],
+            "parameter_bundle_id": _explicit_demo_parameter_bundle(conn, version_id, source_code) or bundles["parameter"],
             "rule_bundle_id": supplied.get("rule_bundle_id", demo_rule_bundle_id or bundles["parameter"]),
             "fee_bundle_id": bundles["fee"],
             "hide_system_hints": False,
@@ -511,6 +587,75 @@ def create_practice_router() -> APIRouter:
         )
         return session
 
+    def plan_qualification(conn: sqlite3.Connection, payload: dict[str, Any], symbols: list[str]) -> dict[str, Any]:
+        issues: list[dict[str, str]] = []
+        limitations: list[str] = []
+        start = end = None
+        try:
+            start = parse_date(payload.get("start_date"), "start_date")
+            end = parse_date(payload.get("end_date"), "end_date")
+            if end < start:
+                raise PracticeError("date_range_invalid", "结束日期不能早于开始日期")
+            if not symbols or len(symbols) > 20 or len(set(symbols)) != len(symbols):
+                raise PracticeError("symbols_invalid", "请选择 1 至 20 只不重复的股票")
+            if any(not isinstance(code, str) or not code.strip() for code in symbols):
+                raise PracticeError("symbols_invalid", "股票代码无效")
+            data = dict(payload)
+            data["name"] = data.get("name") or "我的投资练习"
+            data["positions"] = data.get("positions") or []
+            data["settings"] = {**(data.get("settings") or {}), "watchlist_symbols": symbols}
+            conn.execute("SAVEPOINT plan_qualification")
+            try:
+                session = create_session(conn, payload=data)
+                market = VersionView(conn, session["data_version_id"], expected_source_code=session["source_code"])
+                calendar = market.calendar_days()
+                if market.chunked:
+                    daily_dates = {str(row[0]) for row in conn.execute(
+                        "SELECT DISTINCT m.biz_date FROM data_version_chunk vc JOIN data_chunk_member m ON m.chunk_id=vc.chunk_id WHERE vc.version_id=? AND vc.category='daily'",
+                        (session["data_version_id"],),
+                    ).fetchall()}
+                else:
+                    daily_dates = {str(row[0]) for row in conn.execute(
+                        "SELECT DISTINCT trade_date FROM daily_price WHERE source_code=?", (session["source_code"],)
+                    ).fetchall()}
+                covered_dates = set(calendar).intersection(daily_dates)
+                if start not in covered_dates or end not in covered_dates:
+                    raise PracticeError("date_coverage_unavailable", "开始和结束日期必须同时位于开市日与日线实际覆盖范围内", 422)
+                available = {str(item["ts_code"]) for item in market.securities()}
+                missing = [code for code in symbols if code not in available]
+                if missing:
+                    raise PracticeError("symbol_unavailable", "所选股票不属于当前数据版本：" + ", ".join(missing), 422)
+                for code in symbols:
+                    daily_rows = market.daily_series(code, on_or_before=end)
+                    if not any(start <= str(row["trade_date"]) <= end for row in daily_rows):
+                        raise PracticeError("symbol_daily_unavailable", f"{code} 在所选日期范围没有日线", 422)
+                if session["source_code"] in {"synthetic", "tushare-fixture"}:
+                    limitations.append("当前数据为明确标注的合成演示数据。")
+            except PracticeError:
+                raise
+            finally:
+                conn.execute("ROLLBACK TO plan_qualification")
+                conn.execute("RELEASE plan_qualification")
+        except PracticeError as exc:
+            issues.append({"code": exc.reason, "detail": str(exc)})
+        except (TypeError, ValueError, sqlite3.Error) as exc:
+            issues.append({"code": "qualification_unavailable", "detail": str(exc)[:200]})
+        return {"ready": not issues, "issues": issues, "limitations": limitations,
+                "start_date": start, "end_date": end}
+
+    def plan_response(conn: sqlite3.Connection, plan_id: str, version: int | None = None) -> dict[str, Any]:
+        head = conn.execute("SELECT current_version,status,practice_id,created_at,updated_at FROM practice_plan WHERE plan_id=?", (plan_id,)).fetchone()
+        if head is None:
+            raise PracticeError("plan_not_found", "方案不存在", 404)
+        selected = int(head[0]) if version is None else version
+        row = conn.execute("SELECT status,payload_json,symbols_json,goal,practice_id,qualification_json,created_at FROM practice_plan_version WHERE plan_id=? AND version=?", (plan_id, selected)).fetchone()
+        if row is None:
+            raise PracticeError("plan_version_not_found", "方案版本不存在", 404)
+        return {"plan_id": plan_id, "version": selected, "status": str(row[0]),
+                "payload": decode_json(str(row[1])), "symbols": decode_json(str(row[2])), "goal": str(row[3]),
+                "practice_id": row[4], "created_at": str(row[6]), "updated_at": str(head[4]),
+                "qualification": decode_json(str(row[5]))}
+
     def order_preview(conn: sqlite3.Connection, session: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         code = body.get("ts_code")
         direction = body.get("direction")
@@ -569,6 +714,113 @@ def create_practice_router() -> APIRouter:
         finally:
             conn.close()
 
+    @router.post("/plans")
+    def create_plan(request: Request, body: dict[str, Any]):
+        conn = connect(request)
+        try:
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                key = body.get("idempotency_key")
+                if not isinstance(key, str) or not 1 <= len(key.strip()) <= 160:
+                    raise PracticeError("idempotency_key_required", "必须提供幂等键")
+                request_hash = hashlib.sha256(encode_json(body).encode("utf-8")).hexdigest()
+                old = conn.execute("SELECT request_sha256,response_json FROM practice_plan_idempotency WHERE operation='create_plan' AND idempotency_key=?", (key,)).fetchone()
+                if old:
+                    if old[0] != request_hash:
+                        raise PracticeError("idempotency_conflict", "幂等键已用于不同请求", 409)
+                    return decode_json(str(old[1]))
+                payload = body.get("payload")
+                symbols = body.get("symbols")
+                goal = body.get("goal", "")
+                if not isinstance(payload, dict) or not isinstance(symbols, list) or not isinstance(goal, str) or len(goal) > 8000 or len(encode_json(payload).encode("utf-8")) > 24_000 or len(symbols) > 20 or any(not isinstance(code, str) or len(code) > 40 for code in symbols):
+                    raise PracticeError("plan_invalid", "方案内容无效")
+                plan_id, now = str(uuid.uuid4()), utc_now()
+                qualification = plan_qualification(conn, payload, symbols)
+                conn.execute("INSERT INTO practice_plan(plan_id,current_version,status,created_at,updated_at) VALUES(?,1,'draft',?,?)", (plan_id, now, now))
+                conn.execute("INSERT INTO practice_plan_version(plan_id,version,status,payload_json,symbols_json,goal,qualification_json,created_at) VALUES(?,1,'draft',?,?,?,?,?)",
+                             (plan_id, encode_json(payload), encode_json(symbols), goal, encode_json(qualification), now))
+                result = plan_response(conn, plan_id)
+                conn.execute("INSERT INTO practice_plan_idempotency VALUES('create_plan',?,?,?,?)", (key, request_hash, encode_json(result), now))
+                return result
+        finally:
+            conn.close()
+
+    @router.get("/plans/{plan_id}")
+    def get_plan(request: Request, plan_id: str, version: int | None = Query(None, ge=1)):
+        with connect(request) as conn:
+            return plan_response(conn, plan_id, version)
+
+    @router.put("/plans/{plan_id}")
+    def update_plan(request: Request, plan_id: str, body: dict[str, Any]):
+        conn = connect(request)
+        try:
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                expected, key = body.get("expected_version"), body.get("idempotency_key")
+                if type(expected) is not int or not isinstance(key, str) or not 1 <= len(key.strip()) <= 160:
+                    raise PracticeError("plan_invalid", "expected_version 和幂等键必填")
+                request_hash = hashlib.sha256(encode_json({"plan_id": plan_id, **body}).encode("utf-8")).hexdigest()
+                old = conn.execute("SELECT request_sha256,response_json FROM practice_plan_idempotency WHERE operation='update_plan' AND idempotency_key=?", (key,)).fetchone()
+                if old:
+                    if old[0] != request_hash: raise PracticeError("idempotency_conflict", "幂等键已用于不同请求", 409)
+                    return decode_json(str(old[1]))
+                head = conn.execute("SELECT current_version,status FROM practice_plan WHERE plan_id=?", (plan_id,)).fetchone()
+                if head is None: raise PracticeError("plan_not_found", "方案不存在", 404)
+                if head[0] != expected: raise PracticeError("plan_version_conflict", "方案已更新，请重新读取", 409)
+                if head[1] != "draft": raise PracticeError("plan_confirmed", "已确认方案不可修改", 409)
+                payload, symbols, goal = body.get("payload"), body.get("symbols"), body.get("goal", "")
+                if not isinstance(payload, dict) or not isinstance(symbols, list) or not isinstance(goal, str) or len(goal) > 8000 or len(encode_json(payload).encode("utf-8")) > 24_000 or len(symbols) > 20 or any(not isinstance(code, str) or len(code) > 40 for code in symbols):
+                    raise PracticeError("plan_invalid", "方案内容无效")
+                qualification = plan_qualification(conn, payload, symbols)
+                version, now = expected + 1, utc_now()
+                conn.execute("UPDATE practice_plan SET current_version=?,updated_at=? WHERE plan_id=? AND current_version=? AND status='draft'", (version, now, plan_id, expected))
+                conn.execute("INSERT INTO practice_plan_version(plan_id,version,status,payload_json,symbols_json,goal,qualification_json,created_at) VALUES(?,?,'draft',?,?,?,?,?)",
+                             (plan_id, version, encode_json(payload), encode_json(symbols), goal, encode_json(qualification), now))
+                result = plan_response(conn, plan_id)
+                conn.execute("INSERT INTO practice_plan_idempotency VALUES('update_plan',?,?,?,?)", (key, request_hash, encode_json(result), now))
+                return result
+        finally:
+            conn.close()
+
+    @router.post("/plans/{plan_id}/confirm")
+    def confirm_plan(request: Request, plan_id: str, body: dict[str, Any]):
+        conn = connect(request)
+        try:
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                expected, key = body.get("expected_version"), body.get("idempotency_key")
+                if type(expected) is not int or not isinstance(key, str) or not 1 <= len(key.strip()) <= 160:
+                    raise PracticeError("plan_invalid", "expected_version 和幂等键必填")
+                request_hash = hashlib.sha256(encode_json({"plan_id": plan_id, **body}).encode("utf-8")).hexdigest()
+                old = conn.execute("SELECT request_sha256,response_json FROM practice_plan_idempotency WHERE operation='confirm_plan' AND idempotency_key=?", (key,)).fetchone()
+                if old:
+                    if old[0] != request_hash: raise PracticeError("idempotency_conflict", "幂等键已用于不同请求", 409)
+                    return decode_json(str(old[1]))
+                head = conn.execute("SELECT current_version,status FROM practice_plan WHERE plan_id=?", (plan_id,)).fetchone()
+                if head is None: raise PracticeError("plan_not_found", "方案不存在", 404)
+                if head[0] != expected: raise PracticeError("plan_version_conflict", "方案已更新，请重新读取", 409)
+                plan = plan_response(conn, plan_id)
+                if plan["status"] == "confirmed":
+                    session = view(conn, require_session(conn, plan["practice_id"]), request.app.state.settings)
+                    response = {"plan": plan, "session": session}
+                else:
+                    qualification = plan_qualification(conn, plan["payload"], plan["symbols"])
+                    conn.execute("UPDATE practice_plan_version SET qualification_json=? WHERE plan_id=? AND version=?", (encode_json(qualification), plan_id, expected))
+                    if not qualification["ready"]:
+                        raise PracticeError("plan_not_qualified", "方案尚未满足创建条件", 422)
+                    payload = dict(plan["payload"])
+                    payload["settings"] = {**(payload.get("settings") or {}), "watchlist_symbols": plan["symbols"]}
+                    session_row = create_session(conn, payload=payload)
+                    session = view(conn, session_row, request.app.state.settings)
+                    now = utc_now()
+                    conn.execute("UPDATE practice_plan SET status='confirmed',practice_id=?,updated_at=? WHERE plan_id=? AND current_version=? AND status='draft'", (session_row["practice_id"], now, plan_id, expected))
+                    conn.execute("UPDATE practice_plan_version SET status='confirmed',practice_id=? WHERE plan_id=? AND version=?", (session_row["practice_id"], plan_id, expected))
+                    response = {"plan": plan_response(conn, plan_id), "session": session}
+                conn.execute("INSERT INTO practice_plan_idempotency VALUES('confirm_plan',?,?,?,?)", (key, request_hash, encode_json(response), utc_now()))
+                return response
+        finally:
+            conn.close()
+
     @router.get("/sessions")
     def list_sessions(request: Request, limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
         with connect(request) as conn:
@@ -611,6 +863,83 @@ def create_practice_router() -> APIRouter:
     def get_session(request: Request, practice_id: str):
         with connect(request) as conn:
             return {"session": view(conn, require_session(conn, practice_id), request.app.state.settings)}
+
+    @router.get("/sessions/{practice_id}/workspace")
+    def workspace(request: Request, practice_id: str):
+        from decimal import Decimal, ROUND_HALF_UP
+        with connect(request) as conn:
+            session = require_session(conn, practice_id)
+            state = refreshed_user_state(conn, session)
+            market = VersionView(conn, session["data_version_id"], expected_source_code=session["source_code"])
+            as_of = str(session["revealed_date"])
+            calendar = market.calendar_days(on_or_before=as_of)
+            securities = {str(item["ts_code"]): item for item in market.securities()}
+            all_codes = list(dict.fromkeys(
+                list(session["settings"].get("watchlist_symbols", []))
+                + [str(item["ts_code"]) for item in state["positions"]]
+                + [str(item["ts_code"]) for item in state["orders"]]
+            ))
+            codes = all_codes[:40]
+            limitations: list[str] = []
+            if len(all_codes) > len(codes):
+                limitations.append(f"当前相关证券共 {len(all_codes)} 只，概览最多显示 40 只；其余请在订单或持仓详情查看。")
+            agent_actions: dict[str, str] = {}
+            store = getattr(request.app.state, "agent_store", None)
+            if store is not None and getattr(store, "path", None) is not None and store.path.is_file():
+                tasks, _ = store.list(practice_id, 100, 0, scope="simulation")
+                for task in tasks:
+                    context = task.get("context") or {}
+                    task_date = context.get("revealed_date")
+                    if (task.get("status") != "completed" or task.get("stale")
+                            or context.get("practice_id") != practice_id
+                            or not isinstance(task_date, str) or task_date > as_of
+                            or context.get("revision", 0) > session["revision"]):
+                        continue
+                    for draft in ((task.get("result") or {}).get("drafts") or []):
+                        draft_payload = draft.get("payload") or {}
+                        code = draft_payload.get("ts_code")
+                        if (draft.get("kind") != "trade" or code not in codes or code in agent_actions
+                                or draft.get("revealed_date") != task_date or draft.get("practice_id") != practice_id):
+                            continue
+                        direction = draft_payload.get("direction")
+                        verb = "买入" if direction == "buy" else "卖出" if direction == "sell" else "交易"
+                        agent_actions[code] = f"建议{verb}，尚需你确认（{task_date}）"
+            rows: list[dict[str, Any]] = []
+            for code in codes:
+                daily = market.daily_on(code, as_of)
+                price = None
+                if daily is not None and daily["close"] is not None:
+                    price = int((Decimal(str(daily["close"])) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+                prior_day = None
+                prior = None
+                if as_of in calendar:
+                    index = calendar.index(as_of)
+                    for candidate in reversed(calendar[max(0, index - 250):index]):
+                        prior = market.daily_on(code, candidate)
+                        if prior is not None and prior["close"] is not None and Decimal(str(prior["close"])) > 0:
+                            prior_day = candidate
+                            break
+                change_bps = None
+                if price is not None and prior is not None and prior["close"] is not None and Decimal(str(prior["close"])) != 0:
+                    change_bps = int((((Decimal(str(daily["close"])) / Decimal(str(prior["close"]))) - 1) * 10000).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+                position = next((item for item in state["positions"] if item["ts_code"] == code), None)
+                shares = int(position["shares"]) if position else 0
+                sellable = int(position.get("sellable_shares", 0)) if position else 0
+                value = shares * price if price is not None else None
+                cost = position.get("total_cost_cents") if position else 0
+                pnl = value - int(cost) if value is not None and cost is not None else None
+                security = securities.get(code)
+                rows.append({"ts_code": code, "name": None if security is None else security["name"],
+                             "price_cents": price, "price_date": as_of if price is not None else None,
+                             "change_bps": change_bps, "change_base_date": prior_day if change_bps is not None else None,
+                             "shares": shares, "sellable_shares": sellable,
+                             "market_value_cents": value, "pnl_cents": pnl,
+                             "last_agent_action": agent_actions.get(code)})
+                if price is None: limitations.append(f"{code} 在已揭晓日 {as_of} 没有可用收盘价。")
+            return {"practice_id": practice_id, "revision": int(session["revision"]), "as_of": as_of,
+                    "next_trade_date": next_trade_date(conn, session),
+                    "source": {"code": session["source_code"], "version_id": session["data_version_id"]},
+                    "rows": rows, "limitations": limitations}
 
     @router.get("/sessions/{practice_id}/research-context", response_model=ResearchContextResponse)
     def research_context(request: Request, practice_id: str, expected_revision: int = Query(..., ge=1)):
@@ -739,35 +1068,7 @@ def create_practice_router() -> APIRouter:
         try:
             with conn:
                 conn.execute("BEGIN IMMEDIATE")
-                session = require_session(conn, practice_id)
-                replay, request_hash = idempotent_response(conn, operation=f"order:{practice_id}",
-                                                           key=body.get("idempotency_key"), request=body)
-                if replay is not None:
-                    return replay
-                check_revision(session, body.get("expected_revision"))
-                trade_date = next_trade_date(conn, session)
-                if trade_date is None:
-                    raise PracticeError("no_future_trade_date", "该练习区间没有下一交易日", 409)
-                preview = order_preview(conn, session, body)
-                code = str(preview["ts_code"])
-                direction, shares = preview["direction"], preview["planned_shares"]
-                if direction == "buy" and preview["cash_sufficient_at_known_price"] is False:
-                    raise PracticeError("insufficient_cash", "按已揭晓价格估算的金额超过可用现金", 409)
-                order_id = str(uuid.uuid4())
-                conn.execute(
-                    "INSERT INTO practice_order(order_id,practice_id,idempotency_key,trade_date,ts_code,direction,planned_shares,status,detail_json,created_at)"
-                    " VALUES(?,?,?,?,?,?,?,'pending',?,?)",
-                    (order_id, practice_id, body["idempotency_key"], trade_date, code, direction,
-                     shares, "{}", utc_now()),
-                )
-                user = dict(session["user_state"])
-                user["orders"] = [*user.get("orders", []), {"order_id": order_id, "trade_date": trade_date,
-                    "ts_code": code, "direction": direction, "planned_shares": shares, "status": "pending"}]
-                compare_and_update(conn, session, user_state=user)
-                response = {"ok": True, "session": view(conn, session, request.app.state.settings)}
-                save_idempotency(conn, operation=f"order:{practice_id}", key=body["idempotency_key"],
-                                 request_hash=request_hash, practice_id=practice_id, response=response)
-                return response
+                return place_order_transaction(conn, practice_id, body, request.app.state.settings)
         finally:
             conn.close()
 
@@ -777,27 +1078,7 @@ def create_practice_router() -> APIRouter:
         try:
             with conn:
                 conn.execute("BEGIN IMMEDIATE")
-                session = require_session(conn, practice_id)
-                replay, request_hash = idempotent_response(conn, operation=f"advance:{practice_id}",
-                                                           key=body.get("idempotency_key"), request=body)
-                if replay is not None:
-                    return replay
-                check_revision(session, body.get("expected_revision"))
-                date = next_trade_date(conn, session)
-                if date is None:
-                    raise PracticeError("no_future_trade_date", "该练习区间没有下一交易日", 409)
-                try:
-                    from app.practice.comparison import advance_paths
-                except ImportError as exc:
-                    raise PracticeError("comparison_unavailable", "对照引擎尚未就绪", 503) from exc
-                advance_result = advance_paths(conn, session, date)
-                user_state = refreshed_user_state(conn, session)
-                user_state["last_advance"] = advance_result
-                compare_and_update(conn, session, revealed_date=date, user_state=user_state)
-                response = {"ok": True, "session": view(conn, session, request.app.state.settings)}
-                save_idempotency(conn, operation=f"advance:{practice_id}", key=body["idempotency_key"],
-                                 request_hash=request_hash, practice_id=practice_id, response=response)
-                return response
+                return advance_transaction(conn, practice_id, body, request.app.state.settings)
         finally:
             conn.close()
 
@@ -908,6 +1189,8 @@ def create_practice_router() -> APIRouter:
         from app.practice_data.api import create_practice_data_router
 
         router.include_router(create_practice_data_router())
+        from app.practice.governance import create_storage_router
+        router.include_router(create_storage_router())
     except ImportError:
         pass
     return router

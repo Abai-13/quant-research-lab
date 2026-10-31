@@ -4,6 +4,8 @@ import type {
   CreatePracticeInput,
   DemoPreparation,
   NewPositionInput,
+  PlanPayload,
+  PracticePlan,
   PracticeOptionSymbol,
   PracticeOptions,
 } from "./types";
@@ -48,6 +50,41 @@ function versionOptionLabel(
   const base =
     version.label && version.label !== version.version_id ? version.label : `数据版本 ${index + 1}`;
   return parts.length > 0 ? `${base}（${parts.join(" · ")}）` : base;
+}
+
+function qualificationHint(issue: { code: string; detail: string }, availableRange: string): string {
+  const text = `${issue.code} ${issue.detail}`.toLowerCase().replace(/[-\s]+/g, "_");
+  const dateRange = availableRange || "所选数据版本提供的范围";
+  if (/start_date_after_end|invalid_date_range|date_range_order/.test(text)) {
+    return "结束日期不能早于开始日期。请检查所选区间后重新检查资格。";
+  }
+  if (/start|begin/.test(text) && /date|trading|daily/.test(text)) {
+    return `开始日期暂不可用。请在当前可用范围（${dateRange}）内，选择有行情数据的交易日。`;
+  }
+  if (/end|until/.test(text) && /date|trading|daily/.test(text)) {
+    return `结束日期暂不可用。请在当前可用范围（${dateRange}）内，选择有行情数据的交易日。`;
+  }
+  if (/weekend|holiday|non_trading|not_trading|no_daily_data|missing.*daily.*(bar|data)|daily.*(bar|data).*missing/.test(text)) {
+    return `所选日期可能是休市日或缺少日线行情。请在当前可用范围（${dateRange}）内改选有数据的交易日。`;
+  }
+  if (/date|trading|daily|date_range|trading_range|daily_range/.test(text)) {
+    return `所选日期或行情范围暂不可用。请在当前可用范围（${dateRange}）内选择有数据的交易日。`;
+  }
+  if (/symbol|stock|security|ts_code|ticker/.test(text)) {
+    return "所选证券可能不在当前数据版本中。请核对关注证券和期初持仓后重新检查资格。";
+  }
+  if (/source|provider|data_source/.test(text)) {
+    return "当前数据来源可能不支持这项方案。请检查高级设置中的数据来源后重新检查资格。";
+  }
+  if (/cash|funds|capital|budget/.test(text)) {
+    return "起始资金可能不符合这项方案的要求。请核对起始现金后重新检查资格。";
+  }
+  return "这项方案条件尚未通过检查。请核对方案设置后重新检查资格，并展开下方服务端说明查看具体原因。";
+}
+
+function dateInputBound(value: string | null | undefined): string | undefined {
+  const inputDate = toInputDate(value);
+  return inputDate || undefined;
 }
 
 function SymbolPicker({
@@ -129,28 +166,40 @@ export function NewPracticeForm({
   demo,
   demoBusy,
   creating,
+  planBusy = false,
   onCreate,
+  plan,
+  onSavePlan,
+  onConfirmPlan,
   onPrepareDemo,
   setupDraft,
+  onSetupDraftConsumed,
 }: {
   options: PracticeOptions | null;
   demo: DemoPreparation | null;
   demoBusy: boolean;
   creating: boolean;
-  onCreate: (input: CreatePracticeInput) => Promise<void>;
+  planBusy?: boolean;
+  onCreate?: (input: CreatePracticeInput) => Promise<void>;
+  plan?: PracticePlan | null;
+  onSavePlan?: (payload: PlanPayload, symbols: string[], goal: string, key: string) => Promise<void>;
+  onConfirmPlan?: () => Promise<void>;
   onPrepareDemo: () => Promise<void>;
   setupDraft?: Record<string, unknown> | null;
+  onSetupDraftConsumed?: () => void;
 }) {
   const [name, setName] = useState("我的历史模拟");
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
-  const [cash, setCash] = useState("100000.00");
+  const [cash, setCash] = useState("");
   const [versionId, setVersionId] = useState("");
   const [sourceCode, setSourceCode] = useState("");
   const [hideSystemHints, setHideSystemHints] = useState(false);
   const [positions, setPositions] = useState<PositionDraft[]>([]);
+  const [watchlistSymbols, setWatchlistSymbols] = useState<string[]>([]);
+  const [goal, setGoal] = useState("手动历史模拟练习");
+  const [planDirty, setPlanDirty] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
-  const [step, setStep] = useState<1 | 2 | 3>(1);
   const keyRef = useRef<{ key: string; signature: string } | null>(null);
   const submitInFlightRef = useRef(false);
 
@@ -181,6 +230,9 @@ export function NewPracticeForm({
         options.sources[0]?.code ||
         "",
     );
+    setWatchlistSymbols((current) => current.length ? current : options.symbols[0] ? [options.symbols[0].ts_code] : []);
+    setCash((current) => current || (options.defaults.cash_cents !== null && options.defaults.cash_cents !== undefined ? (options.defaults.cash_cents / 100).toFixed(2) : ""));
+    if (options.defaults.watchlist_symbols?.length) setWatchlistSymbols(options.defaults.watchlist_symbols.slice(0, 20));
   }, [options]);
 
   useEffect(() => {
@@ -206,14 +258,17 @@ export function NewPracticeForm({
 
   useEffect(() => {
     if (!setupDraft) return;
+    if (planBusy || !options) return;
     const date = (value: unknown) => typeof value === "string" ? toInputDate(value) : "";
+    if (setupDraft.kind === "prepared_dataset") {
+      if (typeof setupDraft.data_version_id === "string") setVersionId(setupDraft.data_version_id);
+      if (typeof setupDraft.source_code === "string") setSourceCode(setupDraft.source_code);
+    }
     if (typeof setupDraft.name === "string") setName(setupDraft.name);
     if (setupDraft.start_date) setStartDate(date(setupDraft.start_date));
     if (setupDraft.end_date) setEndDate(date(setupDraft.end_date));
     const cashCents = setupDraft.cash_cents ?? setupDraft.initial_cash_cents;
     if (typeof cashCents === "number" && Number.isFinite(cashCents)) setCash((cashCents / 100).toFixed(2));
-    if (typeof setupDraft.data_version_id === "string") setVersionId(setupDraft.data_version_id);
-    if (typeof setupDraft.source_code === "string") setSourceCode(setupDraft.source_code);
     if (Array.isArray(setupDraft.positions)) {
       const prepared = setupDraft.positions.flatMap((raw): PositionDraft[] => {
         if (!raw || typeof raw !== "object") return [];
@@ -228,19 +283,47 @@ export function NewPracticeForm({
       });
       setPositions(prepared);
     }
+    if (setupDraft.kind === "prepared_dataset" && Array.isArray(setupDraft.symbols) && setupDraft.symbols.every((item) => typeof item === "string")) {
+      const available = new Set(options.symbols.map((item) => item.ts_code));
+      const selected = (setupDraft.symbols as string[]).filter((item) => available.has(item)).slice(0, 20);
+      if (selected.length > 0) setWatchlistSymbols(selected);
+    }
+    setPlanDirty(true);
     setFormError(null);
-  }, [setupDraft]);
+    onSetupDraftConsumed?.();
+  }, [setupDraft, planBusy, options, plan?.plan_id, plan?.version]);
+
+  useEffect(() => {
+    if (!plan) return;
+    const payload = plan.payload;
+    setName(payload.name);
+    setStartDate(toInputDate(payload.start_date));
+    setEndDate(toInputDate(payload.end_date));
+    setCash((payload.cash_cents / 100).toFixed(2));
+    setVersionId(payload.data_version_id);
+    setSourceCode(payload.source_code);
+    setHideSystemHints(Boolean(payload.settings.hide_system_hints));
+    setPositions(payload.positions.map((position) => ({
+      id: crypto.randomUUID(), code: position.ts_code, query: position.ts_code,
+      shares: String(position.shares),
+      cost: position.total_cost_cents === null ? "" : (position.total_cost_cents / 100).toFixed(2),
+      sellable: String(position.sellable_shares),
+    })));
+    setWatchlistSymbols(plan.symbols);
+    setGoal(plan.goal);
+    setPlanDirty(false);
+  }, [plan?.plan_id, plan?.version]);
 
   const selectedVersion = options?.versions.find((version) => version.version_id === versionId) ?? null;
-  const reviewSourceCode = sourceCode || selectedVersion?.source_code || options?.sources[0]?.code || "";
-
   function updatePosition(id: string, patch: Partial<PositionDraft>) {
+    setPlanDirty(true);
     setPositions((current) =>
       current.map((position) => (position.id === id ? { ...position, ...patch } : position)),
     );
   }
 
   function changeVersion(nextId: string) {
+    setPlanDirty(true);
     setVersionId(nextId);
     const version = options?.versions.find((item) => item.version_id === nextId);
     if (version?.source_code) {
@@ -249,7 +332,7 @@ export function NewPracticeForm({
   }
 
   async function handleSubmit() {
-    if (step !== 3 || creating || submitInFlightRef.current) {
+    if (creating || submitInFlightRef.current) {
       return;
     }
     setFormError(null);
@@ -342,8 +425,16 @@ export function NewPracticeForm({
       setFormError("请填写模拟名称。");
       return;
     }
+    if (!goal.trim()) {
+      setFormError("请填写本次练习目标。");
+      return;
+    }
 
-    const payload: CreatePracticeInput = {
+    if (watchlistSymbols.length === 0 || watchlistSymbols.length > 20) {
+      setFormError("请从所选版本的证券中选择 1 至 20 只关注证券。");
+      return;
+    }
+    const payload: PlanPayload = {
       name: name.trim(),
       start_date: startApi,
       end_date: endApi,
@@ -351,332 +442,61 @@ export function NewPracticeForm({
       positions: positionPayload,
       data_version_id: versionId,
       source_code: resolvedSource,
-      settings: { hide_system_hints: hideSystemHints },
-      idempotency_key: "",
+      settings: { hide_system_hints: hideSystemHints, watchlist_symbols: watchlistSymbols },
     };
-    const signature = JSON.stringify({ ...payload, idempotency_key: undefined });
+    const signature = JSON.stringify({ planId: plan?.plan_id ?? null, planVersion: plan?.version ?? null, name, startDate, endDate, cash, versionId, sourceCode, hideSystemHints, positions, watchlistSymbols, goal });
     if (keyRef.current?.signature !== signature) {
       keyRef.current = { key: newIdempotencyKey(), signature };
     }
-    payload.idempotency_key = keyRef.current.key;
 
     submitInFlightRef.current = true;
     try {
-      await onCreate(payload);
-      keyRef.current = null;
-    } catch {
-      // 失败时保留幂等键，用户重试同一份内容不会创建重复会话。
+      if (onSavePlan) {
+        await onSavePlan(payload, watchlistSymbols, goal, keyRef.current.key);
+      } else if (onCreate) {
+        await onCreate({ ...payload, idempotency_key: keyRef.current.key });
+      }
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : "保存方案失败；输入已保留，可以重试。");
     } finally {
       submitInFlightRef.current = false;
     }
   }
 
-  const ready = Boolean(options) && !creating && (options?.versions.length ?? 0) > 0;
 
-  function continueTo(next: 1 | 2 | 3) {
-    setFormError(null);
-    if (next > step && step === 1) {
-      if (!options || !versionId) {
-        setFormError("请选择一个服务端提供的数据版本后继续。");
-        return;
-      }
-      const start = toApiDate(startDate);
-      const end = toApiDate(endDate);
-      if (!start || !end || start > end) {
-        setFormError("请检查开始和结束日期；结束日期不能早于开始日期。");
-        return;
-      }
-    }
-    if (next > step && step === 2) {
-      try {
-        if (parseYuanToCents(cash) === null) throw new Error("请填写起始现金（元）。");
-        for (const [index, position] of positions.entries()) {
-          parseShares(position.shares);
-          if (position.cost.trim()) parseYuanToCents(position.cost, true);
-          if (position.sellable.trim()) parseShares(position.sellable, true);
-          if (!/^[0-9]{6}\.(SZ|SH|BJ)$/.test(position.code.trim().toUpperCase())) {
-            throw new Error(`请为第 ${index + 1} 笔持仓选择有效证券代码。`);
-          }
-        }
-      } catch (error) {
-        setFormError(error instanceof Error ? error.message : "请检查本金与持仓输入。");
-        return;
-      }
-    }
-    setStep(next);
-  }
+  const ready = Boolean(options) && !creating && !planBusy && (options?.versions.length ?? 0) > 0;
 
   return (
     <section className="section practice-card-section" aria-labelledby="new-practice-heading">
       <div className="practice-card practice-form-card">
         <div className="practice-card-header">
-          <div>
-            <h2 id="new-practice-heading">创建历史模拟</h2>
-            <p className="muted">
-              设定一段已经发生的历史区间，从当时可用的信息开始；每天由你手动揭晓下一交易日。
-            </p>
-          </div>
-          <button
-            type="button"
-            className="refresh-button"
-            onClick={() => void onPrepareDemo()}
-            disabled={demoBusy || !options?.demo_available}
-            title={options?.demo_available === false ? "当前没有可用的合成示例数据" : undefined}
-          >
-            {demoBusy ? "准备中…" : "准备内置演示"}
-          </button>
+          <div><h2 id="new-practice-heading">准备一段历史模拟</h2><p className="muted">先定目标和范围，Agent 可协助整理；资格检查通过后由你确认创建。</p></div>
+          <button type="button" className="refresh-button" onClick={() => void onPrepareDemo()} disabled={demoBusy || options?.demo_available === false}>{demoBusy ? "正在准备…" : "准备内置演示"}</button>
         </div>
-
-        {!options ? (
-          <Notice tone="neutral">
-              正在读取可用的数据来源与版本；若历史模拟服务尚未就绪，这里会给出明确提示，而不会显示假选项。
-          </Notice>
-        ) : options.versions.length === 0 ? (
-          <Notice tone="warn" title="暂无可选数据版本">
-            当前没有可选数据版本。可准备内置演示，或展开下方历史数据准备区查看受支持的数据范围。
-          </Notice>
-        ) : null}
-
-        {demo ? (
-          <Notice tone="warn" title="内置合成模拟演示已准备">
-            <p>
-              示例区间 {formatDate(demo.startDate)} ~ {formatDate(demo.endDate)}。这是内置模拟演示使用的合成行情；
-              成交资格仍由所选版本和服务端规则决定。准备完成不会创建模拟，只有第三步确认后才会创建。
-            </p>
-            {demo.limitations.length > 0 ? (
-              <ul className="practice-restrictions">
-                {demo.limitations.map((item) => (
-                  <li key={item}>{item}</li>
-                ))}
-              </ul>
-            ) : null}
-          </Notice>
-        ) : null}
-
-        {options && options.limitations.length > 0 ? (
-          <details className="practice-details">
-            <summary>数据与范围说明</summary>
-            <ul className="practice-restrictions">
-              {options.limitations.map((item) => (
-                <li key={item}>{item}</li>
-              ))}
-            </ul>
-          </details>
-        ) : null}
-
-        <form
-          className="practice-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            setFormError(step === 3 ? "请点击“确认并创建模拟”按钮提交。" : "请使用“继续”完成当前步骤；前两步不会创建模拟。");
-          }}
-        >
-          <ol className="practice-wizard-steps" aria-label="创建步骤">
-            {(["数据与区间", "本金与持仓", "确认摘要"] as const).map((label, index) => {
-              const stepNumber = (index + 1) as 1 | 2 | 3;
-              return (
-                <li key={label}>
-                  <button
-                    type="button"
-                    className={step === stepNumber ? "is-current" : step > stepNumber ? "is-complete" : ""}
-                    aria-current={step === stepNumber ? "step" : undefined}
-                    disabled={stepNumber > step + 1}
-                    onClick={() => continueTo(stepNumber)}
-                  >
-                    <span>{stepNumber}</span>{label}
-                  </button>
-                </li>
-              );
-            })}
-          </ol>
-
-          {step === 1 ? <div className="practice-form-grid">
-            <label className="practice-field">
-              <span>模拟名称</span>
-              <input
-                value={name}
-                disabled={!ready}
-                maxLength={80}
-                onChange={(event) => setName(event.target.value)}
-              />
-            </label>
-            <label className="practice-field">
-              <span>数据版本</span>
-              <select
-                value={versionId}
-                disabled={!ready || !options || options.versions.length === 0}
-                onChange={(event) => changeVersion(event.target.value)}
-              >
-                {options && options.versions.length === 0 ? (
-                  <option value="">暂无可选版本</option>
-                ) : null}
-                {options?.versions.map((version, index) => (
-                  <option key={version.version_id} value={version.version_id}>
-                    {versionOptionLabel(version, index)}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="practice-field">
-              <span>开始日期</span>
-              <input
-                type="date"
-                value={startDate}
-                disabled={!ready}
-                onChange={(event) => setStartDate(event.target.value)}
-              />
-            </label>
-            <label className="practice-field">
-              <span>结束日期</span>
-              <input
-                type="date"
-                value={endDate}
-                disabled={!ready}
-                onChange={(event) => setEndDate(event.target.value)}
-              />
-            </label>
-          </div> : null}
-
-          {step === 2 ? <>
+        {demo ? <Notice tone="neutral" title="演示数据已准备"><p>{formatDate(demo.startDate)} 至 {formatDate(demo.endDate)} · 由服务端返回的合成示例数据。准备数据不会创建练习。</p>{demo.limitations.length ? <ul>{demo.limitations.map(item => <li key={item}>{item}</li>)}</ul> : null}</Notice> : null}
+        {!options ? <Notice tone="neutral">正在读取服务端提供的数据范围与默认值；可用前不会显示假日期或证券。</Notice> : options.versions.length === 0 ? <Notice tone="warn" title="暂无可用数据版本">准备内置演示，或稍后重试服务端数据选项。</Notice> : null}
+        <form className="practice-form" onSubmit={(event) => { event.preventDefault(); void handleSubmit(); }}>
           <div className="practice-form-grid">
-            <label className="practice-field">
-              <span>起始现金（元）</span>
-              <input
-                inputMode="decimal"
-                value={cash}
-                disabled={!ready}
-                onChange={(event) => setCash(event.target.value)}
-              />
-            </label>
-            <label className="practice-field practice-checkbox">
-              <input
-                type="checkbox"
-                checked={hideSystemHints}
-                disabled={!ready}
-                onChange={(event) => setHideSystemHints(event.target.checked)}
-              />
-              <span>默认隐藏系统建议（可随时在模拟中显示）</span>
-            </label>
+            <label className="practice-field practice-field-wide"><span>练习目标</span><input value={goal} maxLength={500} disabled={!ready} onChange={event => { setGoal(event.target.value); setPlanDirty(true); }} placeholder="例如：观察长期持有策略在回撤期的表现" /></label>
+            <label className="practice-field practice-field-wide"><span>练习名称</span><input value={name} maxLength={80} disabled={!ready} onChange={event => { setName(event.target.value); setPlanDirty(true); }} /></label>
+            <label className="practice-field"><span>开始日期</span><input type="date" value={startDate} min={dateInputBound(selectedVersion?.start_date)} max={dateInputBound(selectedVersion?.end_date)} disabled={!ready} onChange={event => { setStartDate(event.target.value); setPlanDirty(true); }} /><small className="practice-field-hint">可用范围：{formatDate(selectedVersion?.start_date ?? null)} 至 {formatDate(selectedVersion?.end_date ?? null)}</small></label>
+            <label className="practice-field"><span>结束日期</span><input type="date" value={endDate} min={dateInputBound(selectedVersion?.start_date)} max={dateInputBound(selectedVersion?.end_date)} disabled={!ready} onChange={event => { setEndDate(event.target.value); setPlanDirty(true); }} /><small className="practice-field-hint">周末、节假日或缺少日线时，请按资格提示改选范围内有数据的交易日。</small></label>
+            <label className="practice-field"><span>起始现金（元）</span><input inputMode="decimal" value={cash} disabled={!ready} onChange={event => { setCash(event.target.value); setPlanDirty(true); }} placeholder="按服务端默认值填写" /></label>
           </div>
-
-          <div className="practice-positions-editor">
-            <div className="practice-positions-head">
-              <h3>期初持仓（可选）</h3>
-              <button
-                type="button"
-                className="refresh-button"
-                disabled={!ready}
-                onClick={() => setPositions((current) => [...current, newPosition()])}
-              >
-                添加持仓
-              </button>
+          <fieldset className="practice-positions-editor"><legend>关注证券</legend><p className="practice-field-hint">用于练习室行情表；选择所选版本实际提供的证券。</p><div className="practice-review-positions">{(options?.symbols ?? []).map(symbol => <label className="practice-checkbox" key={symbol.ts_code}><input type="checkbox" checked={watchlistSymbols.includes(symbol.ts_code)} disabled={!ready} onChange={event => { setWatchlistSymbols(current => event.target.checked ? [...current, symbol.ts_code].slice(0, 20) : current.filter(code => code !== symbol.ts_code)); setPlanDirty(true); }} /><span>{symbol.ts_code} {symbol.name}</span></label>)}{options?.symbols.length === 0 ? <p className="muted">当前版本未返回可用证券。</p> : null}</div></fieldset>
+          <details className="practice-details"><summary>高级设置 · 数据来源、版本与期初持仓</summary>
+            <div className="practice-form-grid">
+              <label className="practice-field"><span>数据版本</span><select value={versionId} disabled={!ready} onChange={event => changeVersion(event.target.value)}>{options?.versions.map((version, index) => <option key={version.version_id} value={version.version_id}>{versionOptionLabel(version, index)}</option>)}</select></label>
+              <label className="practice-field"><span>数据来源</span><select value={sourceCode} disabled={!ready} onChange={event => { setSourceCode(event.target.value); setPlanDirty(true); }}>{options?.sources.map(source => <option key={source.code} value={source.code}>{source.label}</option>)}</select></label>
             </div>
-            {positions.length === 0 ? (
-              <p className="muted">当前为空仓起点。你也可以添加一笔或多笔期初持仓。</p>
-            ) : (
-              <div className="practice-positions-list">
-                {positions.map((position, index) => (
-                  <div className="practice-position-row" key={position.id}>
-                    <div className="practice-position-index">持仓 {index + 1}</div>
-                    <div className="practice-position-fields">
-                      <SymbolPicker
-                        value={position.code}
-                        query={position.query}
-                        symbols={options?.symbols ?? []}
-                        disabled={!ready}
-                        onChange={(code, query) => updatePosition(position.id, { code, query })}
-                      />
-                      <label className="practice-field">
-                        <span>股数</span>
-                        <input
-                          inputMode="numeric"
-                          value={position.shares}
-                          disabled={!ready}
-                          onChange={(event) => updatePosition(position.id, { shares: event.target.value })}
-                        />
-                      </label>
-                      <label className="practice-field">
-                        <span>总成本（元，可空）</span>
-                        <input
-                          inputMode="decimal"
-                          value={position.cost}
-                          disabled={!ready}
-                          onChange={(event) => updatePosition(position.id, { cost: event.target.value })}
-                        />
-                      </label>
-                      <label className="practice-field">
-                        <span>可卖股数（默认全部）</span>
-                        <input
-                          inputMode="numeric"
-                          value={position.sellable}
-                          disabled={!ready}
-                          onChange={(event) => updatePosition(position.id, { sellable: event.target.value })}
-                        />
-                      </label>
-                    </div>
-                    <button
-                      type="button"
-                      className="link-button practice-remove"
-                      disabled={!ready}
-                      onClick={() => setPositions((current) => current.filter((item) => item.id !== position.id))}
-                    >
-                      移除
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-          </> : null}
-
-          {step === 3 ? (
-            <section className="practice-review" aria-labelledby="practice-review-heading">
-              <h3 id="practice-review-heading">检查模拟设置</h3>
-              <dl>
-                <div><dt>模拟名称</dt><dd>{name.trim() || "未填写"}</dd></div>
-                <div><dt>数据模式</dt><dd>{selectedVersion?.synthetic ? "合成示例" : "历史数据"}</dd></div>
-                <div><dt>来源</dt><dd>{options?.sources.find((source) => source.code === reviewSourceCode)?.label || reviewSourceCode || "服务端数据来源"}</dd></div>
-                <div><dt>模拟区间</dt><dd>{formatDate(startDate)} 至 {formatDate(endDate)}</dd></div>
-                <div><dt>起始现金</dt><dd>{cash || "未填写"} 元</dd></div>
-                <div><dt>期初持仓</dt><dd>{positions.length ? `${positions.length} 笔` : "空仓起点"}</dd></div>
-              </dl>
-              {positions.length ? <ul className="practice-review-positions">{positions.map((position, index) => <li key={position.id}>持仓 {index + 1}：{position.query || position.code || "待选证券"}，{position.shares || "未填股数"} 股</li>)}</ul> : null}
-              <p>金额以元填写并按分保存；创建后只会揭晓到已选区间内的日期。所有价格与资格由所选数据版本决定。</p>
-              <details className="practice-details">
-                <summary>高级规则说明</summary>
-                <p className="practice-field-hint">系统路径默认每 5 个已揭晓交易日检查一次，并受个股权重上限与现金保留约束；默认值来自服务端规则组合。</p>
-                <p className="practice-field-hint">内部数据版本：{versionId || "尚未选择"}</p>
-              </details>
-            </section>
-          ) : null}
-
+            <div className="practice-positions-editor"><div className="practice-positions-head"><h3>期初持仓（可选）</h3><button type="button" className="refresh-button" disabled={!ready} onClick={() => { setPositions(current => [...current, newPosition()]); setPlanDirty(true); }}>添加持仓</button></div>
+              {positions.length === 0 ? <p className="muted">空仓起点。需要时可添加期初持仓。</p> : <div className="practice-positions-list">{positions.map((position, index) => <div className="practice-position-row" key={position.id}><div className="practice-position-index">持仓 {index + 1}</div><div className="practice-position-fields"><SymbolPicker value={position.code} query={position.query} symbols={options?.symbols ?? []} disabled={!ready} onChange={(code, query) => updatePosition(position.id, { code, query })} /><label className="practice-field"><span>股数</span><input inputMode="numeric" value={position.shares} disabled={!ready} onChange={event => updatePosition(position.id, { shares: event.target.value })} /></label><label className="practice-field"><span>总成本（元，可空）</span><input inputMode="decimal" value={position.cost} disabled={!ready} onChange={event => updatePosition(position.id, { cost: event.target.value })} /></label><label className="practice-field"><span>可卖股数（默认全部）</span><input inputMode="numeric" value={position.sellable} disabled={!ready} onChange={event => updatePosition(position.id, { sellable: event.target.value })} /></label></div><button type="button" className="link-button practice-remove" disabled={!ready} onClick={() => { setPositions(current => current.filter(item => item.id !== position.id)); setPlanDirty(true); }}>移除</button></div>)}</div>}
+            </div>
+            <label className="practice-checkbox"><input type="checkbox" checked={hideSystemHints} disabled={!ready} onChange={event => { setHideSystemHints(event.target.checked); setPlanDirty(true); }} /><span>默认收起系统建议</span></label>
+          </details>
           {formError ? <Notice tone="error">{formError}</Notice> : null}
-
-          <div className="practice-form-actions">
-            {step > 1 ? <button type="button" className="refresh-button" disabled={creating} onClick={() => continueTo((step - 1) as 1 | 2 | 3)}>上一步</button> : null}
-            {step < 3 ? (
-              <button
-                key="wizard-next"
-                type="button"
-                className="practice-primary"
-                disabled={!ready}
-                onClick={() => continueTo((step + 1) as 1 | 2 | 3)}
-              >
-                继续
-              </button>
-            ) : (
-              <button
-                key="wizard-confirm-create"
-                type="button"
-                className="practice-primary"
-                disabled={!ready || !versionId || creating}
-                onClick={() => void handleSubmit()}
-              >
-                {creating ? "创建中…" : "确认并创建模拟"}
-              </button>
-            )}
-            <span className="muted">草稿保留在本页；确认创建后才会生成新模拟。</span>
-          </div>
+          <div className="practice-form-actions"><button type="submit" className="practice-primary" disabled={!ready || !versionId || creating || !onSavePlan}>{creating ? "正在检查资格…" : plan ? "保存修改并检查资格" : "保存方案并检查资格"}</button><span className="muted">保存会更新同一份方案，不会创建练习。</span></div>
+          {plan ? <section className="practice-review" aria-live="polite"><h3>方案 v{plan.version} · {plan.qualification.ready ? "资格可用" : "需要处理问题"}</h3>{plan.qualification.issues.length ? <ul className="practice-restrictions">{plan.qualification.issues.map((issue, index) => <li key={`${issue.code}-${index}`}><p>{qualificationHint(issue, selectedVersion?.start_date && selectedVersion.end_date ? `${formatDate(selectedVersion.start_date)} 至 ${formatDate(selectedVersion.end_date)}` : "")}</p><details><summary>查看服务端说明</summary><dl><div><dt>代码</dt><dd><code>{issue.code}</code></dd></div><div><dt>详情</dt><dd>{issue.detail}</dd></div></dl></details></li>)}</ul> : <p>服务端未返回阻断问题。</p>}{plan.qualification.limitations.length ? <ul className="practice-restrictions">{plan.qualification.limitations.map(item => <li key={item}>{item}</li>)}</ul> : null}{plan.status === "draft" ? <button type="button" className="practice-primary" disabled={!plan.qualification.ready || planDirty || creating || planBusy || !onConfirmPlan} onClick={() => void onConfirmPlan?.()}>{creating ? "确认中…" : "确认创建练习"}</button> : <p>当前方案状态：{plan.status}。</p>}<p className="practice-field-hint">{planDirty ? "表单有未保存修改；请先保存并重新检查资格。" : `确认将使用已保存的方案 v${plan.version}。`}</p></section> : null}
         </form>
       </div>
     </section>

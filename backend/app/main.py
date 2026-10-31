@@ -21,6 +21,8 @@ from fastapi.responses import JSONResponse
 from . import DISPLAY_NAME, MODE, SERVICE_NAME, __version__
 from .api.portfolio import create_portfolio_router
 from .api.practice import create_practice_router
+from .api.observation import create_observation_router
+from .api.algorithms import create_algorithms_router
 from .api.agent import create_agent_router
 from .api.maintenance import create_maintenance_router
 from .agent_runtime.manager import AgentTaskManager
@@ -30,6 +32,7 @@ from .data.errors import DataError
 from .data.status import data_status
 from .db import DatabaseStatus, check_database, initialize_database
 from .practice.core import PracticeError
+from .practice.observation_runner import ObservationRunner
 
 logger = logging.getLogger("app.main")
 
@@ -120,9 +123,11 @@ def create_app(settings: Settings | None = None, *, agent_gateway=None, agent_to
         except ModuleNotFoundError as exc:
             if exc.name not in {"app.research.executor", "app.research", "app"}:
                 logger.warning("Research executor lifecycle unavailable (%s)", getattr(exc, "name", "unknown"))
+        app.state.observation_runner.recover()
         try:
             yield
         finally:
+            await asyncio.to_thread(app.state.observation_runner.shutdown)
             try:
                 await agent_manager.shutdown()
             finally:
@@ -190,7 +195,12 @@ def create_app(settings: Settings | None = None, *, agent_gateway=None, agent_to
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
 
     app.include_router(create_portfolio_router())
-    app.include_router(create_practice_router())
+    practice_router = create_practice_router()
+    app.state.practice_actions = practice_router.practice_actions
+    app.state.observation_runner = ObservationRunner(resolved, practice_router.practice_actions)
+    app.include_router(practice_router)
+    app.include_router(create_observation_router())
+    app.include_router(create_algorithms_router())
     app.include_router(create_agent_router(resolved, agent_store, agent_manager, agent_gateway, agent_tools))
     app.include_router(create_maintenance_router(resolved))
     for module_name, factory_name in (("app.api.research", "create_research_router"),

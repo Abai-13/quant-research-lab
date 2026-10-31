@@ -1,6 +1,6 @@
 """阶段三 S6：完全隔离的离线演示数据引导。
 
-演示数据库固定位于 ``<runtime_dir>/phase3-demo``，与个人主库 `app.db` 分离。
+演示数据库固定位于 ``<runtime_dir>/phase3-demo-v2-5y``，与个人主库分离；旧缓存保留。
 所有数据均为合成假设，响应始终带 ``synthetic_demo=true``；不读取真实行情、
 不接真实数据源、不写入用户账户。
 """
@@ -25,12 +25,12 @@ __all__ = ["DEMO_ACCOUNT_ID", "ensure_demo_database"]
 
 DEMO_ACCOUNT_ID = "demo_actual"
 DEMO_SOURCE = "tushare-fixture"
-DEMO_DAYS = 160
+DEMO_DAYS = 1305
 DEMO_END = date(2025, 6, 30)
 
 
 def _demo_settings(settings: Settings) -> Settings:
-    root = settings.runtime_dir / "phase3-demo"
+    root = settings.runtime_dir / "phase3-demo-v2-5y"
     return dataclasses.replace(
         settings,
         runtime_dir=root,

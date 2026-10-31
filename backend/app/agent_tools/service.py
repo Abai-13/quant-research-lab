@@ -32,7 +32,7 @@ from app.portfolio.simulation import (
 _MAX_TOOL_ARGS = 16_384
 _MAX_WINDOW = 60
 _TOOLS: list[dict[str, Any]] = [
-    {"type": "function", "function": {"name": "prepare_setup_draft", "description": "整理新模拟条件为待检查草稿，不读取行情或账户且不创建模拟。", "parameters": {"type": "object", "properties": {"name": {"type": "string", "maxLength": 120}, "start_date": {"type": "string", "pattern": "^\\d{8}$"}, "end_date": {"type": "string", "pattern": "^\\d{8}$"}, "cash_cents": {"type": "integer", "minimum": 0, "maximum": 100000000000}, "positions": {"type": "array", "maxItems": 100, "items": {"type": "object", "additionalProperties": False, "required": ["ts_code", "shares"], "properties": {"ts_code": {"type": "string", "maxLength": 20}, "shares": {"type": "integer", "minimum": 1, "maximum": 1000000000}, "sellable_shares": {"type": ["integer", "null"], "minimum": 0}, "total_cost_cents": {"type": ["integer", "null"], "minimum": 0}}}}, "preferences": {"type": "string", "maxLength": 1000}}, "required": ["name", "start_date", "end_date", "cash_cents"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "prepare_setup_draft", "description": "整理新模拟条件为待检查草稿，不读取行情或账户且不创建模拟。", "parameters": {"type": "object", "properties": {"name": {"type": "string", "maxLength": 120}, "start_date": {"type": "string", "pattern": "^\\d{8}$"}, "end_date": {"type": "string", "pattern": "^\\d{8}$"}, "cash_cents": {"type": "integer", "minimum": 0, "maximum": 100000000000}, "positions": {"type": "array", "maxItems": 100, "items": {"type": "object", "additionalProperties": False, "required": ["ts_code", "shares"], "properties": {"ts_code": {"type": "string", "maxLength": 20}, "shares": {"type": "integer", "minimum": 1, "maximum": 1000000000}, "sellable_shares": {"type": ["integer", "null"], "minimum": 0}, "total_cost_cents": {"type": ["integer", "null"], "minimum": 0}}}}, "symbols": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": True, "items": {"type": "string", "minLength": 1, "maxLength": 40}}, "preferences": {"type": "string", "maxLength": 1000}}, "required": ["name", "start_date", "end_date", "cash_cents"], "additionalProperties": False}}},
     {"type": "function", "function": {"name": "get_simulation_state", "description": "读取绑定模拟在已揭晓日的持仓、订单和可见决策记录。", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
     {"type": "function", "function": {"name": "get_source_quality", "description": "读取当前冻结数据版本的来源、覆盖质量和用途限制。", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
     {"type": "function", "function": {"name": "preview_trade", "description": "按当前已揭晓价格和现有费用规则做只读试算；不提交订单，未来成交价格保持未知。", "parameters": {"type": "object", "properties": {"ts_code": {"type": "string", "maxLength": 20}, "direction": {"type": "string", "enum": ["buy", "sell"]}, "planned_shares": {"type": "integer", "minimum": 1, "maximum": 10000000}}, "required": ["ts_code", "direction", "planned_shares"], "additionalProperties": False}}},
@@ -136,11 +136,34 @@ def validate_context(settings: Settings, context: Mapping[str, Any]) -> None:
         expected = _fingerprint({"scope": "setup"})
         if context.get("context_fingerprint") != expected or context.get("practice_id") is not None:
             raise PracticeError("context_stale", "设置草稿上下文已变化。", 409)
-        return
-    live = capture_context(settings, context.get("practice_id"), context.get("revision"))
-    for field in ("revision", "revealed_date", "data_version_id", "source_code", "algorithm_version", "algorithm_fingerprint", "fee_version", "fee_fingerprint", "segment_fingerprint", "context_fingerprint"):
-        if live.get(field) != context.get(field):
-            raise PracticeError("context_stale", "模拟日期或版本已变化，请重新查询。", 409)
+    else:
+        live = capture_context(settings, context.get("practice_id"), context.get("revision"))
+        for field in ("revision", "revealed_date", "data_version_id", "source_code", "algorithm_version", "algorithm_fingerprint", "fee_version", "fee_fingerprint", "segment_fingerprint", "context_fingerprint"):
+            if live.get(field) != context.get(field):
+                raise PracticeError("context_stale", "模拟日期或版本已变化，请重新查询。", 409)
+    plan_id, plan_version = context.get("plan_id"), context.get("plan_version")
+    if plan_id is not None:
+        if not isinstance(plan_id, str) or type(plan_version) is not int or plan_version < 1:
+            raise PracticeError("plan_context_invalid", "方案版本上下文无效。", 409)
+        from pathlib import Path
+        from ..practice.runtime import practice_settings
+        path = practice_settings(settings).db_path
+        if not Path(path).is_file():
+            raise PracticeError("plan_stale", "方案已不可用，请重新读取。", 409)
+        uri = Path(path).resolve().as_uri() + "?mode=ro"
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=3)
+            try:
+                head = conn.execute("SELECT current_version,practice_id FROM practice_plan WHERE plan_id=?", (plan_id,)).fetchone()
+                version = conn.execute("SELECT status,practice_id FROM practice_plan_version WHERE plan_id=? AND version=?", (plan_id, plan_version)).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            raise PracticeError("plan_unavailable", "无法验证方案版本。", 409) from exc
+        if head is None or version is None or int(head[0]) != plan_version:
+            raise PracticeError("plan_stale", "方案版本已变化，请重新披露并分析。", 409)
+        if version[1] != context.get("practice_id") or head[1] != context.get("practice_id"):
+            raise PracticeError("plan_context_invalid", "方案与当前练习不匹配。", 409)
 
 
 def _output(context: Mapping[str, Any], name: str, data: dict[str, Any], summary: str, *, drafts: list[dict[str, Any]] | None = None, limitations: list[str] | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
@@ -196,6 +219,12 @@ def _validate_setup(arguments: Mapping[str, Any]) -> None:
                 raise PracticeError("tool_arguments_invalid", f"{field} 必须为非负整数或 null。")
         if position.get("sellable_shares") is not None and position["sellable_shares"] > shares:
             raise PracticeError("tool_arguments_invalid", "可卖数量不能超过持仓数量。")
+    symbols = arguments.get("symbols")
+    if symbols is not None:
+        if (not isinstance(symbols, list) or not 1 <= len(symbols) <= 20
+                or any(not isinstance(code, str) or not code.strip() or len(code) > 40 for code in symbols)
+                or len(set(symbols)) != len(symbols)):
+            raise PracticeError("tool_arguments_invalid", "关注股票须为1至20个唯一有效代码。")
     preferences = arguments.get("preferences", "")
     if not isinstance(preferences, str) or len(preferences) > 1000:
         raise PracticeError("tool_arguments_invalid", "偏好说明最多1000个字符。")
@@ -263,13 +292,15 @@ def execute_tool(settings: Settings, context: Mapping[str, Any], name: str, argu
     if name == "prepare_setup_draft":
         if context.get("scope") != "setup":
             raise PracticeError("setup_scope_required", "设置草稿仅允许在未绑定模拟时生成。")
-        allowed = {"name", "start_date", "end_date", "cash_cents", "positions", "preferences"}
+        allowed = {"name", "start_date", "end_date", "cash_cents", "positions", "symbols", "preferences"}
         required = {"name", "start_date", "end_date", "cash_cents"}
         _require_keys(arguments, allowed, required)
         _validate_setup(arguments)
         draft_id = "dr_" + uuid.uuid4().hex
         payload = {k: arguments[k] for k in sorted(arguments)}
         draft = {"draft_id": draft_id, "kind": "setup", "practice_id": None, "expected_revision": None, "revealed_date": None, "context_fingerprint": context["context_fingerprint"], "payload": payload, "limitations": ["仅为新建表单草稿；需用户检查并通过既有模拟创建界面提交。"]}
+        if context.get("plan_id") is not None:
+            draft.update({"plan_id": context["plan_id"], "expected_plan_version": context["plan_version"]})
         return _output(context, name, {"fields": payload}, "已整理模拟条件草稿，未读取行情或账户。", drafts=[draft])
 
     if context.get("scope") != "simulation":
@@ -336,6 +367,8 @@ def execute_tool(settings: Settings, context: Mapping[str, Any], name: str, argu
             known_pass = reason is None and not unknown
             data = {"ts_code": code, "direction": side, "planned_shares": shares, "as_of": session["revealed_date"], "known_price_cents": price_cents, "estimated_notional_cents": price_cents * shares if price_cents is not None else None, "fee_estimate": fee, "fee_version": bundle.get("version") if bundle else None, "fee_assumption_scope": bundle.get("assumption_scope") if bundle else None, "board_lot_shares": board_lot if valid_board_lot else None, "known_checks": checks, "known_constraints_pass": known_pass, "execution_date": next_day, "future_execution_price_cents": None, "future_execution_status": "unknown", "restriction": reason, "unknown_checks": unknown, "writes_order": False, "limitations": ["未来成交价格、停牌、涨跌停和开盘成交条件尚未知；已通过的已知条件不保证将来成交。"]}
             draft = {"draft_id": "dr_" + uuid.uuid4().hex, "kind": "trade", "practice_id": context["practice_id"], "expected_revision": context["revision"], "revealed_date": context["revealed_date"], "context_fingerprint": context["context_fingerprint"], "payload": {"ts_code": code, "direction": side, "planned_shares": shares}, "limitations": ["草稿不会下单；用户确认后必须由既有订单 API 重新核验版本、日期、规则与幂等键。", "成交日价格未知，费用是按已揭晓价格做的模拟估算。"]}
+            if context.get("plan_id") is not None:
+                draft.update({"plan_id": context["plan_id"], "expected_plan_version": context["plan_version"]})
             return _output(context, name, data, "使用冻结版本的已揭晓收盘价、费用规则和买入整手规则完成只读试算；未写入订单。", drafts=[draft], limitations=draft["limitations"] + data["limitations"], conn=conn)
         if name == "compare_review":
             _require_keys(arguments, set(), set())

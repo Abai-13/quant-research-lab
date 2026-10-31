@@ -61,7 +61,7 @@ def test_offline_demo_is_isolated_and_supports_recommendation_and_simulation(
         assert demo_state.status_code == 200
         assert demo_state.json()["state"]["cash_cents"] == 1_000_000
         # 演示库位于独立目录，不写主库。
-        assert (temp_settings.runtime_dir / "phase3-demo").is_dir()
+        assert (temp_settings.runtime_dir / "phase3-demo-v2-5y").is_dir()
         with sqlite3.connect(temp_settings.db_path) as conn:
             assert conn.execute(
                 "SELECT COUNT(*) FROM account WHERE account_id='demo_actual'"

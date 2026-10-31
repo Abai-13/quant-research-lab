@@ -57,4 +57,28 @@ def register_ranker() -> None:
 py -3.12 .\backend\examples\deterministic_sample.py
 ```
 
+## 历史练习的算法注册与运行
+
+`GET /api/practice/algorithms` 从生产的 SignalCalculator、SelectionPolicy 与 AllocationPolicy 注册表枚举可执行组合，返回观察计划可直接冻结的 `algorithm_id`、组合 `version`、名称、说明、参数、限制和完整 `components` 配置。执行器用 `resolve_algorithm(algorithm_id, version, parameters)` 解析固定组合，或调用 `calculate_registered_algorithm(conn, context, account_state, algorithm_id=..., algorithm_version=..., parameters=...)`。底层 `calculate_practice_targets(conn, context, account_state, configuration)` 对每个组件名称、版本和参数作严格校验，不会静默切回基线。
+
+该服务接收 portfolio 服务绑定的 `signal_input` 上下文，使用其固定 `VersionView`、revealed date、证券范围与规则组合，调用已注册组件并返回冻结组件、逐证券信号/排除理由、选择与分配结果。金额字段以整数分表示；股数以股表示。服务只读，不写账本、不推进练习、不创建成交。扩展算法须由受控源码显式登记，不支持动态上传或导入任意代码。
+
+运行完整离线演示：
+
+```powershell
+py -3.12 .\backend\examples\registered_algorithm_sample.py
+```
+
+演示数据仅写入隔离 TEMP，只验证合成输入下的组件调用与复算，不代表真实收益或模型智能。
+
+样例使用满足默认流动性门槛的合成成交额，断言真实服务选中 SYN-A、给出 360000 分目标，并与独立 Decimal 手算对账；不靠降低生产筛选门槛制造正向结果。
+
+## 有限自动模拟
+
+观察计划的创建与启动分别确认：`POST /api/practice/observe-plans` 只保存授权，`/{execution_id}/start` 才运行；暂停、撤销和恢复均使用授权 `expected_version` 与 `idempotency_key`，恢复另外要求 `consent=true`。下单与推进日期独立授权，最多20步。`max_position_shares` 限制模拟账户持仓总股数，`max_order_value_cents` 限制单笔成交本金（整数分）。没有推进权限时最多生成一次订单批次并结束，待人工推进。
+
+每一步在同一 SQLite 事务内检查当前权限、数据/算法/规则/费用版本，调用手动流程共用的订单和推进服务，保存进度。暂停/撤销返回后旧执行令牌不能继续写；有外部修改或待执行的人工订单则停止。未知下一日价格造成超限时整步回滚。进程重启将运行计划置为暂停，用户核对后明确恢复；不会自动续跑或重复已提交步骤。运行器使用确定性注册算法，不调用模型。真实行情仍须通过来源和用途资格检查；明确合成演示的假设不适用于真实来源。
+
+五年演示缓存使用 `phase3-demo-v2-5y`，原 `phase3-demo` 及旧版本引用保留。存储清理只覆盖未引用的准备数据版本；磁盘已分配文件的实际回收不承诺与估算字节相等。
+
 运行扩展测试时使用项目指定的 Python 环境和现有测试命令。新示例不要调用网络，不读 `.env`，不修改共享依赖，不碰正式库。若确需增加依赖或需要外部数据/服务，应通过项目维护流程先明确依赖及验证范围。

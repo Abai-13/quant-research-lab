@@ -31,6 +31,22 @@ def test_setup_scope_is_draft_only_and_does_not_initialize_practice_database(tem
         execute_tool(temp_settings, context, "get_simulation_state", {})
 
 
+def test_setup_draft_preserves_watch_symbols_as_separate_scope(temp_settings):
+    context = capture_context(temp_settings, None)
+    result = execute_tool(temp_settings, context, "prepare_setup_draft", {
+        "name": "关注列表", "start_date": "20250102", "end_date": "20250131",
+        "cash_cents": 100000, "symbols": ["600000.SH", "000001.SZ"],
+    })
+    draft = result["drafts"][0]
+    assert draft["payload"]["symbols"] == ["600000.SH", "000001.SZ"]
+    assert "positions" not in draft["payload"]
+    with pytest.raises(PracticeError):
+        execute_tool(temp_settings, context, "prepare_setup_draft", {
+            "name": "重复", "start_date": "20250102", "end_date": "20250131",
+            "cash_cents": 100000, "symbols": ["600000.SH", "600000.SH"],
+        })
+
+
 def test_tools_reject_unknown_tool_and_extra_arguments(temp_settings):
     context = capture_context(temp_settings, None)
     with pytest.raises(PracticeError, match="未知工具"):

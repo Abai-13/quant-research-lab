@@ -16,6 +16,8 @@ def test_builtin_demo_binds_synthetic_market_rules_and_fills_once(temp_settings)
         demo = demo_response.json()
         source = demo["demo"]
         version = next(item for item in demo["versions"] if item["version_id"] == source["version_id"])
+        assert source["start_date"] <= "20200630"
+        assert source["end_date"] == "20250630"
         code = demo["symbols"][0]["ts_code"]
         created_response = client.post(
             "/api/practice/sessions",

@@ -92,7 +92,7 @@ def startup_operations(settings: Any = None) -> None:
                     changed = conn.execute("UPDATE practice_data_job SET status='queued',generation=generation+1,updated_at=? WHERE job_id=? AND generation=? AND status IN ('queued','running','publishing')", (_now(), row["job_id"], row["generation"])).rowcount
                     conn.commit()
                     if changed:
-                        _submit(_run_job, lambda s=settings: practice_connect(s), str(row["job_id"]), store.decode_json(row["request_json"]), int(row["timeout_seconds"]), int(row["generation"])+1)
+                        _submit(_run_job, lambda s=settings: practice_connect(s), str(row["job_id"]), store.decode_json(row["request_json"]), int(row["timeout_seconds"]), int(row["generation"])+1, settings)
             finally:
                 conn.close()
             _recovered_runtimes.add(runtime_key)
@@ -227,7 +227,7 @@ def get_job(conn: sqlite3.Connection, job_id: str) -> dict[str, Any] | None:
 def submit_job(
     conn_factory: Callable[[], sqlite3.Connection],
     normalized: dict[str, Any],
-    *, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    *, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS, settings=None,
 ) -> dict[str, Any]:
     if timeout_seconds < 1 or timeout_seconds > HARD_TIMEOUT_SECONDS:
         raise RefreshError("invalid_timeout", f"timeout_seconds 必须为 1..{HARD_TIMEOUT_SECONDS}")
@@ -236,6 +236,10 @@ def submit_job(
     try:
         ensure_operation_schema(conn)
         conn.commit()
+        if settings is not None:
+            from app.practice.governance import assert_prepare_capacity
+            assert_prepare_capacity(settings, conn)
+            conn.commit()
         conn.execute("BEGIN IMMEDIATE")
         old = conn.execute("SELECT j.* FROM practice_data_idempotency i JOIN practice_data_job j USING(job_id) WHERE i.idempotency_key=?", (normalized["idempotency_key"],)).fetchone()
         if old:
@@ -268,7 +272,7 @@ def submit_job(
         conn.commit()
     finally:
         conn.close()
-    _submit(_run_job, conn_factory, job_id, normalized, timeout_seconds, 1)
+    _submit(_run_job, conn_factory, job_id, normalized, timeout_seconds, 1, settings)
     conn = conn_factory()
     try:
         return _operation_view(_job(conn, job_id)) or {}
@@ -319,7 +323,7 @@ def _load_checkpoints(conn: sqlite3.Connection, job_id: str) -> dict[str, list[d
     return result
 
 
-def _run_job(conn_factory: Callable[[], sqlite3.Connection], job_id: str, normalized: dict[str, Any], timeout_seconds: int, generation: int) -> None:
+def _run_job(conn_factory: Callable[[], sqlite3.Connection], job_id: str, normalized: dict[str, Any], timeout_seconds: int, generation: int, settings: Any = None) -> None:
     started = time.monotonic()
     total = len(normalized["symbols"])
     _set_progress(conn_factory, job_id, "running", 0, total, generation=generation)
@@ -394,6 +398,9 @@ def _run_job(conn_factory: Callable[[], sqlite3.Connection], job_id: str, normal
         )
         if not publication_allowed():
             raise RefreshError("publication_fenced", "任务已取消或超时，拒绝桥接发布", 409)
+        from app.practice.governance import assert_prepare_capacity
+        if settings is not None:
+            assert_prepare_capacity(settings, conn)
         from .bridge import publish_prepared_dataset
         bridge = publish_prepared_dataset(conn, response["version"]["version_id"])
         prepared_dataset = {
@@ -474,7 +481,7 @@ def resume_job(conn_factory: Callable[[], sqlite3.Connection], job_id: str, expe
     finally:
         conn.close()
     if start_runner:
-        _submit(_run_job, conn_factory, job_id, normalized, timeout_seconds, generation)
+        _submit(_run_job, conn_factory, job_id, normalized, timeout_seconds, generation, None)
     return response
 
 

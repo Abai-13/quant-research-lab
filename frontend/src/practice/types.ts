@@ -151,6 +151,8 @@ export interface PracticeDefaults {
   data_version_id: string | null;
   source_code: string | null;
   name: string | null;
+  cash_cents?: number | null;
+  watchlist_symbols?: string[];
 }
 
 export interface PracticeOptions {
@@ -189,6 +191,51 @@ export interface CreatePracticeInput {
   source_code: string;
   settings: PracticeSettings;
   idempotency_key: string;
+}
+
+export type PlanPayload = Omit<CreatePracticeInput, "idempotency_key">;
+
+export interface PracticePlan {
+  plan_id: string;
+  version: number;
+  status: "draft" | "confirmed";
+  payload: PlanPayload;
+  symbols: string[];
+  goal: string;
+  practice_id: string | null;
+  created_at: string;
+  updated_at: string;
+  qualification: {
+    ready: boolean;
+    issues: Array<{ code: string; detail: string }>;
+    limitations: string[];
+    start_date: string | null;
+    end_date: string | null;
+  };
+}
+
+export interface WorkspaceRow {
+  ts_code: string;
+  name: string;
+  price_cents: number | null;
+  price_date: string | null;
+  change_bps: number | null;
+  change_base_date?: string | null;
+  shares: number | null;
+  sellable_shares: number | null;
+  market_value_cents: number | null;
+  pnl_cents: number | null;
+  last_agent_action: string | null;
+}
+
+export interface PracticeSessionWorkspace {
+  practice_id: string;
+  revision: number;
+  as_of: string | null;
+  next_trade_date: string | null;
+  source: PracticeSource;
+  rows: WorkspaceRow[];
+  limitations: string[];
 }
 
 export interface OrderPreview {

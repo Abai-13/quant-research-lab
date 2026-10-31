@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from typing import Any, Sequence
 
@@ -20,6 +21,20 @@ from .store import bump_generation
 from .timeutil import utc_now_iso
 
 POOL_RULE_VERSION = "pool-2026-10-22.1"
+
+
+@contextmanager
+def _pool_write(conn):
+    """Commit standalone writes, while preserving a caller's outer transaction."""
+    conn.execute("SAVEPOINT pool_snapshot_write")
+    try:
+        yield
+    except BaseException:
+        conn.execute("ROLLBACK TO pool_snapshot_write")
+        conn.execute("RELEASE pool_snapshot_write")
+        raise
+    else:
+        conn.execute("RELEASE pool_snapshot_write")
 
 # 排除原因码
 REASON_NOT_LISTED_YET = "not_listed_yet"
@@ -376,7 +391,7 @@ def generate_pool_snapshot(
         "SELECT generated_at, member_count FROM pool_snapshot WHERE snapshot_id=?", (snapshot_id,)
     ).fetchone()
     generated_at = existing[0] if existing else utc_now_iso()
-    with conn:
+    with _pool_write(conn):
         conn.execute(
             "INSERT OR IGNORE INTO pool_snapshot(snapshot_id, as_of, data_version_id, rule_version,"
             " params, limit_flags, member_count, manifest_sha256, generated_at)"

@@ -88,6 +88,41 @@ PRACTICE_SCHEMA = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_practice_decision_session_date ON practice_decision(practice_id, decision_date, recorded_at)",
+    """
+    CREATE TABLE IF NOT EXISTS practice_plan (
+        plan_id TEXT PRIMARY KEY,
+        current_version INTEGER NOT NULL CHECK(current_version >= 1),
+        status TEXT NOT NULL CHECK(status IN ('draft','confirmed')),
+        practice_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS practice_plan_version (
+        plan_id TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version >= 1),
+        status TEXT NOT NULL CHECK(status IN ('draft','confirmed')),
+        payload_json TEXT NOT NULL,
+        symbols_json TEXT NOT NULL,
+        goal TEXT NOT NULL,
+        practice_id TEXT,
+        qualification_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(plan_id, version),
+        FOREIGN KEY(plan_id) REFERENCES practice_plan(plan_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS practice_plan_idempotency (
+        operation TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_sha256 TEXT NOT NULL,
+        response_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(operation, idempotency_key)
+    )
+    """,
 )
 
 

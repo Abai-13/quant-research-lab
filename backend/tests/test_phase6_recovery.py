@@ -251,7 +251,9 @@ def test_practice_data_startup_requeues_persisted_inflight_job_idempotently(tmp_
         with practice_connect(settings) as conn:
             row = conn.execute("SELECT status,generation FROM practice_data_job WHERE job_id='job-recovery'").fetchone()
             assert tuple(row) == ("queued", 5)
-        assert len(submitted) == 1 and submitted[0][1] == "job-recovery" and submitted[0][-1] == 5
+        assert len(submitted) == 1
+        assert submitted[0][1] == "job-recovery" and submitted[0][4] == 5
+        assert submitted[0][5] is settings
     finally:
         data_operations.shutdown_operations(wait=True)
         data_operations.shutdown_operations(wait=True)

@@ -6,7 +6,8 @@ import asyncio
 import importlib
 import json
 import re
-from typing import Any
+import sqlite3
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -46,6 +47,8 @@ class TaskBody(BaseModel):
     idempotency_key:str=Field(min_length=8,max_length=160)
     limits:dict[str,Any]|None=None
     parent_task_id:str|None=None
+    plan_id:str|None=None
+    expected_plan_version:int|None=Field(default=None,ge=1)
 
 class CancelBody(BaseModel):
     model_config=ConfigDict(extra="forbid")
@@ -73,6 +76,68 @@ def _failure(exc:Exception, reason:str, status:int=400)->HTTPException:
 def _public_config(gateway:Any,settings:Settings)->dict[str,Any]:
     return gateway.get_public_config(settings)
 
+def _bind_plan(settings:Settings, context:dict[str,Any], plan_id:str|None, expected_version:int|None,
+               practice_id:str|None, store:AgentStore|None=None, parent_task_id:str|None=None)->None:
+    if plan_id is None:
+        if expected_version is not None: raise HTTPException(422,detail={"ok":False,"reason":"plan_version_required","detail":"plan_id is required."})
+        return
+    if expected_version is None: raise HTTPException(422,detail={"ok":False,"reason":"plan_version_required","detail":"expected_plan_version is required."})
+    from ..practice.runtime import practice_settings
+    db_path=practice_settings(settings).db_path
+    if not db_path.is_file(): raise HTTPException(409,detail={"ok":False,"reason":"plan_not_found","detail":"Plan is unavailable."})
+    uri=db_path.resolve().as_uri()+"?mode=ro"
+    try:
+        with sqlite3.connect(uri,uri=True,timeout=3) as conn:
+            conn.row_factory=sqlite3.Row
+            head=conn.execute("SELECT current_version,practice_id FROM practice_plan WHERE plan_id=?",(plan_id,)).fetchone()
+            row=conn.execute("SELECT status,payload_json,symbols_json,goal,practice_id,qualification_json FROM practice_plan_version WHERE plan_id=? AND version=?",(plan_id,expected_version)).fetchone()
+            if head is None or row is None: raise HTTPException(409,detail={"ok":False,"reason":"plan_not_found","detail":"Plan version is unavailable."})
+            if int(head["current_version"])!=expected_version: raise HTTPException(409,detail={"ok":False,"reason":"plan_version_stale","detail":"Review the latest plan version."})
+            linked=row["practice_id"]
+            if linked!=practice_id: raise HTTPException(409,detail={"ok":False,"reason":"plan_context_invalid","detail":"Plan belongs to a different practice."})
+            qualification=json.loads(row["qualification_json"])
+            if row["status"]!="confirmed" and not qualification.get("ready"):
+                issues=qualification.get("issues") or []
+                hint="；".join(str(item.get("detail") or item.get("code")) for item in issues[:3]) or "请修正日期、来源或证券范围后重新检查。"
+                raise HTTPException(422,detail={"ok":False,"reason":"plan_not_qualified","detail":"方案尚未通过资格检查："+hint})
+            full_payload=json.loads(row["payload_json"])
+            from app.data.chunks import VersionView
+            market=VersionView(conn,str(full_payload["data_version_id"]),expected_source_code=str(full_payload["source_code"]))
+            names={str(item["ts_code"]):item["name"] for item in market.securities()}
+            public_payload={k:full_payload.get(k) for k in ("name","start_date","end_date","cash_cents","positions","data_version_id","source_code")}
+            settings=full_payload.get("settings")
+            if isinstance(settings,dict):
+                public_payload["settings"]={k:settings[k] for k in (
+                    "rebalance_every_n_days","hide_system_hints","max_single_name_weight_bp",
+                    "min_cash_reserve_bp","parameter_bundle_id","rule_bundle_id","fee_bundle_id",
+                    "constraints","watchlist_symbols") if k in settings}
+            plan_context={"plan_id":plan_id,"version":expected_version,"status":row["status"],
+                          "payload":public_payload,
+                          "symbols":json.loads(row["symbols_json"]),"symbol_metadata":[{"ts_code":code,"name":names.get(code)} for code in json.loads(row["symbols_json"])],"goal":row["goal"]}
+    except HTTPException: raise
+    except (sqlite3.Error,ValueError,TypeError): raise HTTPException(409,detail={"ok":False,"reason":"plan_unavailable","detail":"Plan context is unavailable."}) from None
+    history=[]
+    parent=store.get(parent_task_id) if store is not None and parent_task_id else None
+    seen=set()
+    for _ in range(3):
+        if not parent or parent["task_id"] in seen: break
+        seen.add(parent["task_id"])
+        pc=parent.get("context") or {}
+        prior_version=pc.get("plan_version")
+        if (pc.get("plan_id")!=plan_id or (prior_version is not None and prior_version>expected_version)
+                or parent.get("practice_id")!=practice_id
+                or pc.get("context_fingerprint")!=context.get("context_fingerprint")): break
+        if parent.get("status")=="completed":
+            result=parent.get("result") or {}
+            history.append({"goal":parent.get("goal","")[:300],"summary":str(result.get("summary") or "")[:800],
+                            "drafts":(result.get("drafts") or [])[:5]})
+        parent=store.get(parent.get("parent_task_id")) if parent.get("parent_task_id") else None
+    context["plan_id"]=plan_id; context["plan_version"]=expected_version
+    model_context=dict(context.get("model_context") or {})
+    model_context["current_plan"]=plan_context
+    model_context["prior_plan_turns"]=history
+    context["model_context"]=model_context
+
 def _config_payload(config_result:dict[str,Any])->tuple[str,dict[str,Any]]:
     config=config_result.get("config")
     if not config_result.get("configured") or not isinstance(config,dict):
@@ -93,7 +158,7 @@ def _credential_generation(settings:Settings, config:dict[str,Any])->str|None:
     value=config.get("credential_generation")
     return str(value) if value is not None else None
 
-def _disclosure(settings:Settings,gateway:Any,tools:Any,practice_id:str|None,expected_revision:int|None,limits_override:dict[str,Any]|None=None)->tuple[dict[str,Any],dict[str,Any]]:
+def _disclosure(settings:Settings,gateway:Any,tools:Any,practice_id:str|None,expected_revision:int|None,limits_override:dict[str,Any]|None=None,plan_id:str|None=None,expected_plan_version:int|None=None,store:AgentStore|None=None,parent_task_id:str|None=None)->tuple[dict[str,Any],dict[str,Any]]:
     try:
         public=_public_config(gateway,settings); config_version,config=_config_payload(public)
         credential_generation=_credential_generation(settings,config)
@@ -105,6 +170,7 @@ def _disclosure(settings:Settings,gateway:Any,tools:Any,practice_id:str|None,exp
             raise ValueError("context_invalid")
         if not isinstance(context.get("context_fingerprint"),str) or not context["context_fingerprint"]:
             raise ValueError("context_invalid")
+        _bind_plan(settings,context,plan_id,expected_plan_version,practice_id,store,parent_task_id)
     except HTTPException:raise
     except Exception as exc: raise _failure(exc,"context_unavailable",409) from None
     limits={"rounds":8,"tool_calls":20,"timeout_seconds":120,"tokens":4_096}
@@ -128,11 +194,11 @@ def _disclosure(settings:Settings,gateway:Any,tools:Any,practice_id:str|None,exp
     categories=["user_goal","current_simulation_context","tool_evidence","generated_drafts"]
     binding={"config_version":config_version,"target":target,"context_fingerprint":context.get("context_fingerprint"),
              "practice_id":context.get("practice_id"),"revision":context.get("revision"),"revealed_date":context.get("revealed_date"),
-             "data_version_id":context.get("data_version_id"),"credential_generation":credential_generation,
+             "data_version_id":context.get("data_version_id"),"plan_id":context.get("plan_id"),"plan_version":context.get("plan_version"),"credential_generation":credential_generation,
              "data_categories":categories,"limits":limits}
     consent_digest=hashlib.sha256(canonical(binding).encode("utf-8")).hexdigest()
     disclosure={"config_version":config_version,"target":target,"context":{k:context.get(k) for k in
-        ("scope","practice_id","revision","revealed_date","data_version_id","source_code","context_fingerprint","limitations")},
+        ("scope","practice_id","revision","revealed_date","data_version_id","source_code","context_fingerprint","limitations","plan_id","plan_version","model_context")},
         "data_categories":categories,"credential_generation":credential_generation,
         "purpose":"Research assistance for the bound historical simulation; evidence and drafts only.",
         "possible_cost":True,"limits":limits,"consent_digest":consent_digest}
@@ -197,9 +263,9 @@ def create_agent_router(settings:Settings,store:AgentStore|None=None,manager:Age
         except Exception as exc:raise _failure(exc,"agent_test_failed",502) from None
 
     @router.get("/disclosure")
-    def get_disclosure(practice_id:str|None=None,expected_revision:int|None=None):
+    def get_disclosure(practice_id:str|None=None,expected_revision:int|None=None,plan_id:str|None=None,expected_plan_version:int|None=None):
         gw=gateway or _service("app.agent_gateway"); tl=tools or _service("app.agent_tools")
-        return _disclosure(settings,gw,tl,practice_id,expected_revision)[0]
+        return _disclosure(settings,gw,tl,practice_id,expected_revision,plan_id=plan_id,expected_plan_version=expected_plan_version,store=agent_store)[0]
 
     @router.post("/tasks",status_code=202)
     async def create_task(body:TaskBody):
@@ -211,7 +277,7 @@ def create_agent_router(settings:Settings,store:AgentStore|None=None,manager:Age
         if existing is not None:
             return {k:v for k,v in existing.items() if k not in ("consent_digest","limits","attempt")}
         gw=gateway or _service("app.agent_gateway"); tl=tools or _service("app.agent_tools")
-        disclosure,context=await asyncio.to_thread(_disclosure,settings,gw,tl,body.practice_id,body.expected_revision)
+        disclosure,context=await asyncio.to_thread(_disclosure,settings,gw,tl,body.practice_id,body.expected_revision,None,body.plan_id,body.expected_plan_version,agent_store,body.parent_task_id)
         effective_limits=_lower_limits(disclosure["limits"],body.limits)
         current_config,config=_config_payload(await asyncio.to_thread(_public_config,gw,settings))
         if body.config_version!=current_config or body.consent_digest!=disclosure["consent_digest"]:
@@ -221,11 +287,16 @@ def create_agent_router(settings:Settings,store:AgentStore|None=None,manager:Age
             parent=agent_store.get(body.parent_task_id)
             if not parent or parent["practice_id"]!=body.practice_id or parent["context"].get("context_fingerprint")!=context.get("context_fingerprint"):
                 raise HTTPException(409,detail={"ok":False,"reason":"parent_context_invalid","detail":"Parent task must exist and have the same bound simulation context."})
+            parent_plan_id=parent["context"].get("plan_id")
+            parent_plan_version=parent["context"].get("plan_version")
+            if (parent_plan_id!=body.plan_id
+                    or (body.plan_id is not None and (parent_plan_version is None or parent_plan_version>body.expected_plan_version))):
+                raise HTTPException(409,detail={"ok":False,"reason":"parent_plan_invalid","detail":"Parent task must belong to this plan and no newer plan version."})
         try:
             view,created=agent_store.create(key=body.idempotency_key,payload=body.model_dump(),practice_id=body.practice_id,
                 scope=str(context.get("scope")),goal=body.goal,config_version=body.config_version,context=context,
                 consent_digest=body.consent_digest,limits=effective_limits,parent_task_id=body.parent_task_id,
-                credential_generation=disclosure.get("credential_generation"))
+                credential_generation=disclosure.get("credential_generation"),plan_id=body.plan_id)
         except IdempotencyConflict:
             raise HTTPException(409,detail={"ok":False,"reason":"idempotency_conflict","detail":"Idempotency key was already used with a different payload."}) from None
         except ValueError as exc:
@@ -234,8 +305,9 @@ def create_agent_router(settings:Settings,store:AgentStore|None=None,manager:Age
         return {k:v for k,v in view.items() if k not in ("consent_digest","limits","attempt")}
 
     @router.get("/tasks")
-    def list_tasks(practice_id:str|None=None,limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0,le=1_000_000)):
-        rows,total=agent_store.list(practice_id,limit,offset)
+    def list_tasks(practice_id:str|None=None,plan_id:str|None=None,scope:Literal["setup","simulation"]|None=None,
+                   limit:int=Query(20,ge=1,le=100),offset:int=Query(0,ge=0,le=1_000_000)):
+        rows,total=agent_store.list(practice_id,limit,offset,plan_id=plan_id,scope=scope)
         rows=[_refresh_stale(row,settings,agent_store,tools) for row in rows]
         return {"tasks":[{k:v for k,v in row.items() if k not in ("consent_digest","limits","attempt")} for row in rows],"total":total}
 
@@ -294,7 +366,7 @@ def create_agent_router(settings:Settings,store:AgentStore|None=None,manager:Age
         if row["generation"]!=body.expected_generation or row["status"]!="interrupted":
             raise HTTPException(409,detail={"ok":False,"reason":"generation_conflict","detail":"Operation changed; refresh its status."})
         gw=gateway or _service("app.agent_gateway"); tl=tools or _service("app.agent_tools")
-        disclosure,context=await asyncio.to_thread(_disclosure,settings,gw,tl,row["practice_id"],row["context"].get("revision"),row["limits"])
+        disclosure,context=await asyncio.to_thread(_disclosure,settings,gw,tl,row["practice_id"],row["context"].get("revision"),row["limits"],row["context"].get("plan_id"),row["context"].get("plan_version"),agent_store,row.get("parent_task_id"))
         if (body.config_version!=row["config_version"] or disclosure["config_version"]!=body.config_version
                 or body.consent_digest!=disclosure["consent_digest"]
                 or (str(disclosure.get("credential_generation")) if disclosure.get("credential_generation") is not None else None)!=row.get("credential_generation")

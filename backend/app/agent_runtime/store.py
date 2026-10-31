@@ -66,9 +66,10 @@ class AgentStore:
                               ("resumable", "INTEGER NOT NULL DEFAULT 0"),
                               ("lease_owner", "TEXT"), ("lease_until", "TEXT"),
                               ("resume_key_hash", "TEXT"), ("resume_payload_hash", "TEXT"),
-                              ("credential_generation", "TEXT")):
+                              ("credential_generation", "TEXT"), ("plan_id", "TEXT")):
                 if name not in columns:
                     conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {ddl}")
+            conn.execute("CREATE INDEX IF NOT EXISTS task_plan_scope_idx ON tasks(practice_id,plan_id,scope,created_at DESC)")
             rows = conn.execute("SELECT task_id,checkpoint_json FROM tasks WHERE status IN ('queued','running')").fetchall()
             for task_id, _checkpoint_json in rows:
                 now = utc_now()
@@ -111,7 +112,7 @@ class AgentStore:
     def create(self, *, key: str, payload: dict[str, Any], practice_id: str | None, scope: str,
                goal: str, config_version: str, context: dict[str, Any], consent_digest: str,
                limits: dict[str, Any], parent_task_id: str | None = None,
-               credential_generation: str | int | None = None) -> tuple[dict[str, Any], bool]:
+               credential_generation: str | int | None = None, plan_id: str | None = None) -> tuple[dict[str, Any], bool]:
         encoded = canonical(payload)
         if len(encoded.encode("utf-8")) > MAX_JSON:
             raise ValueError("request_too_large")
@@ -119,7 +120,7 @@ class AgentStore:
         key_hash = digest(key)
         now = utc_now()
         task_id = str(uuid.uuid4())
-        context_public = {k: context.get(k) for k in ("scope", "practice_id", "revision", "revealed_date", "data_version_id", "source_code", "context_fingerprint", "limitations")}
+        context_public = {k: context.get(k) for k in ("scope", "practice_id", "revision", "revealed_date", "data_version_id", "source_code", "context_fingerprint", "limitations", "plan_id", "plan_version", "model_context")}
         if len(canonical(context_public).encode("utf-8")) > 32_000:
             raise ValueError("context_too_large")
         context_fingerprint = str(context.get("context_fingerprint") or digest(context_public))
@@ -131,11 +132,11 @@ class AgentStore:
                 return self._view(existing), False
             conn.execute("""INSERT INTO tasks(task_id,idempotency_key,payload_hash,practice_id,scope,status,goal,
                 config_version,context_json,context_fingerprint,consent_digest,limits_json,created_at,updated_at,
-                parent_task_id,usage_json,credential_generation) VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?)""",
+                parent_task_id,usage_json,credential_generation,plan_id) VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (task_id,key_hash,payload_hash,practice_id,scope,goal,config_version,canonical(context_public),context_fingerprint,
                  consent_digest,canonical(limits),now,now,parent_task_id,canonical({"input_tokens":None,"output_tokens":None,"total_tokens":None,
                  "model_calls":0,"tool_calls":0,"elapsed_ms":0,"estimated_cost":None}),
-                 str(credential_generation) if credential_generation is not None else None))
+                 str(credential_generation) if credential_generation is not None else None,plan_id))
             self._append_event(conn,task_id,"task_started","Task queued.")
             row = conn.execute("SELECT * FROM tasks WHERE task_id=?",(task_id,)).fetchone()
             return self._view(row), True
@@ -166,11 +167,15 @@ class AgentStore:
             row=conn.execute("SELECT * FROM tasks WHERE task_id=?",(task_id,)).fetchone()
             return self._view(row) if row else None
 
-    def list(self, practice_id: str | None, limit: int, offset: int) -> tuple[list[dict[str, Any]], int]:
+    def list(self, practice_id: str | None, limit: int, offset: int, *, plan_id: str | None = None,
+             scope: str | None = None) -> tuple[list[dict[str, Any]], int]:
         limit=max(1,min(limit,100)); offset=max(0,min(offset,1_000_000))
         with self._connect() as conn:
-            where=" WHERE practice_id=?" if practice_id is not None else ""
-            args=(practice_id,) if practice_id is not None else ()
+            clauses=[]; args=[]
+            if practice_id is not None: clauses.append("practice_id=?"); args.append(practice_id)
+            if plan_id is not None: clauses.append("plan_id=?"); args.append(plan_id)
+            if scope is not None: clauses.append("scope=?"); args.append(scope)
+            where=(" WHERE "+" AND ".join(clauses)) if clauses else ""
             total=int(conn.execute("SELECT COUNT(*) FROM tasks"+where,args).fetchone()[0])
             rows=conn.execute("SELECT * FROM tasks"+where+" ORDER BY created_at DESC LIMIT ? OFFSET ?",(*args,limit,offset)).fetchall()
             return [self._view(r) for r in rows],total

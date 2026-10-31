@@ -184,7 +184,7 @@ export function TradePanel({
       });
       keyRef.current = null;
       setStatus(
-        `订单已登记，将在最早可执行日 ${formatDate(session.next_trade_date)} 按当时价格尝试成交。成交价尚未揭晓。`,
+        "订单已由服务端受理。请查看订单列表中的状态和成交日期，成交价以服务端记录为准。",
       );
       setDraft((current) => ({ ...current, shares: "" }));
       setPreview(null);

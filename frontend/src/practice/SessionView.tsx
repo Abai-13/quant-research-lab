@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import "./practice-session.css";
 
 import type {
@@ -9,9 +9,11 @@ import type {
   PracticeOptions,
   PracticeReport,
   PracticeView,
+  PracticeSessionWorkspace,
 } from "./types";
 import {
   directionLabel,
+  formatBps,
   formatCents,
   formatDate,
   formatShares,
@@ -28,7 +30,6 @@ import {
   ScalarFields,
   SectionHeading,
   StatusBadge,
-  StatusChip,
   sourceLabel,
   type Tone,
 } from "./ui";
@@ -52,6 +53,10 @@ function symbolLabel(symbol: PracticeOptionSymbol): string {
 
 export function SessionView({
   session,
+  workspace,
+  workspaceError,
+  agentPanel,
+  agentStatus,
   options,
   market,
   marketLoading,
@@ -76,6 +81,10 @@ export function SessionView({
   onRetryReport,
 }: {
   session: PracticeView;
+  workspace: PracticeSessionWorkspace | null;
+  workspaceError: string | null;
+  agentPanel: ReactNode;
+  agentStatus: string;
   options: PracticeOptions | null;
   market: MarketSeries | null;
   marketLoading: boolean;
@@ -111,6 +120,7 @@ export function SessionView({
   const finishTriggerRef = useRef<HTMLButtonElement>(null);
   const restartTriggerRef = useRef<HTMLButtonElement>(null);
   const [marketQuery, setMarketQuery] = useState("");
+  const [mobileView, setMobileView] = useState<"agent" | "overview">("agent");
   const finished = isFinished(session.status);
 
   function closeConfirmation() {
@@ -222,9 +232,6 @@ export function SessionView({
           <h1>{session.name}</h1>
           <div className="practice-session-tags">
             <StatusBadge status={session.status} />
-            <StatusChip tone={session.source.synthetic ? "warn" : "ok"}>
-              {sourceLabel(session.source)}
-            </StatusChip>
             <span className="muted">
               {formatDate(session.start_date)} ~ {formatDate(session.end_date)}
             </span>
@@ -235,6 +242,10 @@ export function SessionView({
           <strong>{session.revealed_date ? formatDate(session.revealed_date) : "尚未揭晓"}</strong>
           <span>下一交易日</span>
           <strong>{session.next_trade_date ? formatDate(session.next_trade_date) : "—"}</strong>
+          <span>数据来源</span>
+          <strong>{sourceLabel(session.source)}</strong>
+          <span>Agent 状态</span>
+          <strong>{agentStatus}</strong>
         </div>
       </header>
 
@@ -243,6 +254,11 @@ export function SessionView({
           {notice.text}
         </Notice>
       ) : null}
+
+      <div className="practice-mobile-tabs" role="group" aria-label="练习视图">
+        <button type="button" aria-pressed={mobileView === "agent"} onClick={() => setMobileView("agent")}>Agent 与下单</button>
+        <button type="button" aria-pressed={mobileView === "overview"} onClick={() => setMobileView("overview")}>练习概览</button>
+      </div>
 
       {sourceLimitations.length > 0 ? (
         <details className="practice-details">
@@ -281,7 +297,13 @@ export function SessionView({
       ) : null}
 
       <div className="practice-workspace-grid">
-        <div className="practice-workspace-main">
+        <div className={`practice-workspace-main ${mobileView === "agent" ? "mobile-view-hidden" : ""}`}>
+          <section className="practice-card" aria-labelledby="watchlist-heading">
+            <div className="practice-card-header"><div><h3 id="watchlist-heading">关注证券与持仓</h3><p className="muted">截至 {formatDate(workspace?.as_of ?? session.revealed_date)} · {sourceLabel(session.source)}</p></div><button type="button" className="refresh-button" onClick={onRefresh} disabled={Boolean(busy)}>刷新</button></div>
+            {workspaceError ? <Notice tone="warn" title="练习工作区数据暂不可用">{workspaceError}</Notice> : null}
+            {workspace?.practice_id === session.practice_id ? <div className="practice-table-wrap"><table className="practice-table"><thead><tr><th>证券</th><th>现价 / 日期</th><th>涨跌（基准）</th><th>持仓 / 可卖</th><th>市值</th><th>盈亏</th><th>最近 Agent 动作</th></tr></thead><tbody>{workspace.rows.map((row) => <tr key={row.ts_code}><th>{row.name ? `${row.name} · ` : ""}{row.ts_code}</th><td>{formatCents(row.price_cents)} 元 · {formatDate(row.price_date)}</td><td>{row.change_bps === null ? "未知" : `${formatBps(row.change_bps)} · ${formatDate(row.change_base_date ?? null)}`}</td><td>{row.shares === null ? "未知" : `${formatShares(row.shares)} 股`} / {row.sellable_shares === null ? "未知" : `${formatShares(row.sellable_shares)} 股`}</td><td>{formatCents(row.market_value_cents)} 元</td><td>{formatCents(row.pnl_cents)} 元</td><td>{row.last_agent_action ?? "未知"}</td></tr>)}</tbody></table></div> : <p className="muted">正在读取服务端工作区；未知值会保留为未知。</p>}
+            {workspace?.limitations.length ? <details className="practice-details"><summary>工作区限制</summary><ul>{workspace.limitations.map((item) => <li key={item}>{item}</li>)}</ul></details> : null}
+          </section>
           <section className="practice-card" aria-labelledby="positions-heading">
             <div className="practice-card-header">
               <h3 id="positions-heading">当前持仓</h3>
@@ -316,6 +338,7 @@ export function SessionView({
             )}
           </section>
 
+          <details className="practice-details practice-secondary-room-details"><summary>订单与已揭晓行情</summary>
           <section className="practice-card" aria-labelledby="orders-heading">
             <div className="practice-card-header">
               <h3 id="orders-heading">订单</h3>
@@ -412,9 +435,11 @@ export function SessionView({
               </EmptyState>
             )}
           </section>
+          </details>
         </div>
 
-        <div className="practice-workspace-side">
+        <div className={`practice-workspace-side ${mobileView === "overview" ? "mobile-view-hidden" : ""}`}>
+          {agentPanel}
           <TradePanel
             session={session}
             symbols={options?.symbols ?? []}
@@ -519,7 +544,7 @@ export function SessionView({
         </div>
       ) : null}
 
-      <section className="section" aria-labelledby="comparison-heading">
+      <details className="practice-details practice-secondary-room-details"><summary>路径对照与收益明细</summary><section className="section" aria-labelledby="comparison-heading">
         <SectionHeading
           id="comparison-heading"
           title="对照曲线"
@@ -572,7 +597,7 @@ export function SessionView({
             </ul>
           ) : null}
         </div>
-      </section>
+      </section></details>
 
       <section className="section" aria-labelledby="decisions-heading">
         <SectionHeading id="decisions-heading" title="决策记录">

@@ -153,7 +153,7 @@ def create_practice_data_router() -> APIRouter:
             settings = getattr(request.app.state, "settings", None) or load_settings()
             provider = _CONNECT_PROVIDER or _default_connect_provider()
             conn_factory = lambda: provider(settings)
-            result = operations.submit_job(conn_factory, normalized, timeout_seconds=timeout)
+            result = operations.submit_job(conn_factory, normalized, timeout_seconds=timeout, settings=settings)
         except RefreshError as exc:
             return _error(exc)
         except RuntimeError as exc:
